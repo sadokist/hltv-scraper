@@ -549,6 +549,9 @@ async def run_pipeline_v2(
     # Per-client match counter for proactive proxy rotation
     client_match_count: dict[int, int] = {id(c): 0 for c in clients}
     _PROXY_ROTATE_EVERY = 50  # rotate less often — restarts waste ~10s
+    # Track consecutive restart failures per client to prevent death spiral
+    client_restart_failures: dict[int, int] = {id(c): 0 for c in clients}
+    _MAX_RESTART_FAILURES = 5  # after 5 failed restarts, long cooldown
     t0 = time.monotonic()
 
     def _fail_status(entry: dict) -> str:
@@ -564,14 +567,26 @@ async def run_pipeline_v2(
 
             # Health check: restart browser if Chrome crashed or unresponsive
             if not client.is_healthy:
+                rf = client_restart_failures.get(id(client), 0)
+                if rf >= _MAX_RESTART_FAILURES:
+                    # Long cooldown to let resources recover
+                    logger.warning(
+                        "Client has %d consecutive restart failures — cooling down 30s",
+                        rf,
+                    )
+                    await asyncio.sleep(30.0)
                 try:
                     await client.restart()
                     client_failures[id(client)] = 0
+                    client_restart_failures[id(client)] = 0
                 except Exception as restart_exc:
-                    logger.error("Browser restart failed for match %d: %s",
-                                 entry["match_id"], restart_exc)
+                    client_restart_failures[id(client)] = rf + 1
+                    logger.error("Browser restart failed for match %d (attempt %d): %s",
+                                 entry["match_id"], rf + 1, restart_exc)
                     counters["failed"] += 1
                     results["overview"]["failed"] += 1
+                    # Cooldown before client re-enters queue
+                    await asyncio.sleep(min(5.0 * (rf + 1), 30.0))
                     return
 
             # Per-match timeout: defense-in-depth against hung matches
@@ -601,8 +616,11 @@ async def run_pipeline_v2(
                     try:
                         await client.restart()
                         client_failures[id(client)] = 0
+                        client_restart_failures[id(client)] = 0
                     except Exception:
-                        logger.error("Circuit-breaker restart failed")
+                        client_restart_failures[id(client)] = client_restart_failures.get(id(client), 0) + 1
+                        logger.error("Circuit-breaker restart failed (attempt %d)",
+                                     client_restart_failures[id(client)])
                 return
 
             client_match_count[id(client)] = client_match_count.get(id(client), 0) + 1
@@ -624,6 +642,7 @@ async def run_pipeline_v2(
                     try:
                         await client.restart()
                         client_failures[id(client)] = 0
+                        client_restart_failures[id(client)] = 0
                     except Exception:
                         logger.error("Proactive proxy rotation restart failed")
             else:
@@ -643,8 +662,11 @@ async def run_pipeline_v2(
                     try:
                         await client.restart()
                         client_failures[id(client)] = 0
+                        client_restart_failures[id(client)] = 0
                     except Exception:
-                        logger.error("Circuit-breaker restart failed")
+                        client_restart_failures[id(client)] = client_restart_failures.get(id(client), 0) + 1
+                        logger.error("Circuit-breaker restart failed (attempt %d)",
+                                     client_restart_failures[id(client)])
         except Exception as exc:
             counters["failed"] += 1
             results["overview"]["failed"] += 1

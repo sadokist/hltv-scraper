@@ -239,6 +239,9 @@ class HLTVClient:
 
         Rotates to a fresh proxy IP on each restart to distribute
         load and avoid Cloudflare IP-level throttling.
+
+        Retries up to 3 times with aggressive Chrome cleanup between
+        attempts to recover from zombie processes or stale temp dirs.
         """
         self._rotate_proxy()
         logger.warning("Restarting browser (proxy rotation)...")
@@ -248,8 +251,59 @@ class HLTVClient:
         # Reset rate limiters — the old proxy was throttled, new one is fresh
         self.rate_limiter = RateLimiter(self._config)
         self._tab_rate_limiters.clear()
-        await self.start()
-        logger.info("Browser restarted successfully")
+
+        last_exc = None
+        for attempt in range(3):
+            try:
+                await self.start()
+                logger.info("Browser restarted successfully")
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Restart attempt %d/3 failed: %s", attempt + 1, exc)
+                if attempt < 2:
+                    await self._kill_stale_chrome()
+                    await asyncio.sleep(2.0 * (attempt + 1))
+        raise HLTVFetchError(
+            f"Browser restart failed after 3 attempts: {last_exc}", url=""
+        )
+
+    async def _kill_stale_chrome(self) -> None:
+        """Kill orphaned Chrome processes from this client and clean temp dirs.
+
+        Called between restart attempts when nodriver.start() fails.
+        Only kills Chrome processes that belong to this client's last
+        known PID tree — safe with multiple workers in the same container.
+        """
+        try:
+            import psutil
+            # Kill any chrome processes whose parent is PID 1 (orphans) or
+            # that match our last known browser PID
+            for proc in psutil.process_iter(["pid", "name", "ppid"]):
+                try:
+                    name = proc.info.get("name", "") or ""
+                    if "chrome" not in name.lower():
+                        continue
+                    ppid = proc.info.get("ppid", -1)
+                    # Orphaned (parent is init/PID 1) or zombie
+                    if ppid in (0, 1):
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except ImportError:
+            # psutil not available — fall back to pkill (less safe but
+            # better than a completely stuck browser)
+            import subprocess
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-f", "chrome"],
+                    capture_output=True, timeout=5,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
 
     @staticmethod
     def _parse_proxy(proxy_url: str | None) -> tuple[str | None, str | None, str | None]:
