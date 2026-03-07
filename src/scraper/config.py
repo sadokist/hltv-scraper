@@ -18,17 +18,16 @@ class ScraperConfig:
     max_delay: float = 3.0
 
     # Adaptive backoff on challenge/error
-    backoff_factor: float = 2.0
+    backoff_factor: float = 1.5
 
     # Gradual recovery on success (multiply current delay by this)
-    # 0.85 recovers ~3× faster than 0.95 after a backoff spike
-    recovery_factor: float = 0.85
+    recovery_factor: float = 0.75
 
     # Maximum delay ceiling (seconds)
-    max_backoff: float = 30.0
+    max_backoff: float = 3.0
 
     # tenacity stop_after_attempt
-    max_retries: int = 4
+    max_retries: int = 3
 
     # Seconds to wait after navigation for page to load (fallback retries).
     # Ready-selector polling is the real gate; this is only used for
@@ -46,16 +45,16 @@ class ScraperConfig:
     concurrent_tabs: int = 2
 
     # CDP navigation timeout (asyncio.wait_for around tab.get())
-    navigation_timeout: float = 30.0
+    navigation_timeout: float = 15.0
 
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
-    evaluate_timeout: float = 15.0
+    evaluate_timeout: float = 8.0
 
     # Hard ceiling per match — defense-in-depth (2 minutes)
     per_match_timeout: float = 180.0
 
     # Seconds to poll for Cloudflare challenge to clear during fetches
-    challenge_wait: float = 90.0
+    challenge_wait: float = 30.0
 
     # HLTV base URL (single-site scraper)
     base_url: str = HLTV_BASE_URL

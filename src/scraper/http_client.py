@@ -539,7 +539,7 @@ class HLTVClient:
             # tearing down the old DOM.  0.5s balances speed with reliability
             # (0.1s was too fast — DOM was still from the previous page).
             _orig_sleep = tab.sleep
-            tab.sleep = lambda t=0.5: _orig_sleep(0.5)
+            tab.sleep = lambda t=0.3: _orig_sleep(0.3)
             try:
                 # Nav lock serialises CDP Page.navigate across tabs (multi-tab only)
                 nav_coro = asyncio.wait_for(
@@ -619,7 +619,7 @@ class HLTVClient:
             # for 'complete' (new page fully loaded).
             expected_path = urlparse(url).path
             saw_loading = False
-            _phase1_deadline = time.monotonic() + 3.0  # 3s wall-clock max
+            _phase1_deadline = time.monotonic() + 2.0  # 2s wall-clock max
             while time.monotonic() < _phase1_deadline:
                 try:
                     result = await self._safe_evaluate(
@@ -640,7 +640,7 @@ class HLTVClient:
 
             # Now wait for readyState to reach 'complete' (new page loaded)
             settled = False
-            _phase2_deadline = time.monotonic() + 8.0  # 8s wall-clock max
+            _phase2_deadline = time.monotonic() + 5.0  # 5s wall-clock max
             while time.monotonic() < _phase2_deadline:
                 try:
                     result = await self._safe_evaluate(
@@ -663,7 +663,7 @@ class HLTVClient:
             # still be showing.  Verify via content fingerprint — if the
             # page text hasn't changed, wait up to 3s for the real load.
             if _pre_nav_fp and not saw_loading:
-                _fp_deadline = time.monotonic() + 3.0  # 3s wall-clock max
+                _fp_deadline = time.monotonic() + 2.0  # 2s wall-clock max
                 _fp_matched = False
                 while time.monotonic() < _fp_deadline:
                     try:
@@ -990,7 +990,7 @@ class HLTVClient:
 
     @retry(
         retry=retry_if_exception_type((CloudflareChallenge, HLTVFetchError)),
-        wait=wait_exponential_jitter(initial=2, max=20, jitter=2),
+        wait=wait_exponential_jitter(initial=1, max=8, jitter=1),
         stop=stop_after_attempt(4),  # overridden in _patch_retry
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
@@ -1070,7 +1070,7 @@ class HLTVClient:
 
     @retry(
         retry=retry_if_exception_type((CloudflareChallenge, HLTVFetchError)),
-        wait=wait_exponential_jitter(initial=2, max=20, jitter=2),
+        wait=wait_exponential_jitter(initial=1, max=8, jitter=1),
         stop=stop_after_attempt(4),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
@@ -1222,7 +1222,7 @@ class HLTVClient:
         """Patch tenacity stop/wait to use config.max_retries."""
         self.fetch.retry.stop = stop_after_attempt(self._config.max_retries)
         self.fetch_with_tab.retry.stop = stop_after_attempt(self._config.max_retries)
-        _wait = wait_exponential_jitter(initial=2, max=20, jitter=2)
+        _wait = wait_exponential_jitter(initial=1, max=8, jitter=1)
         self.fetch.retry.wait = _wait
         self.fetch_with_tab.retry.wait = _wait
 

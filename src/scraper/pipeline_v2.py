@@ -548,7 +548,7 @@ async def run_pipeline_v2(
     _TIMEOUT_RESTART_THRESHOLD = 2
     # Per-client match counter for proactive proxy rotation
     client_match_count: dict[int, int] = {id(c): 0 for c in clients}
-    _PROXY_ROTATE_EVERY = 15
+    _PROXY_ROTATE_EVERY = 50  # rotate less often — restarts waste ~10s
     t0 = time.monotonic()
 
     async def process_one(entry: dict) -> None:
