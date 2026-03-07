@@ -341,19 +341,22 @@ class HLTVClient:
         first_tab = await self._browser.get(warmup_url)
         await asyncio.sleep(self._config.page_load_wait)
 
+        _warmup_eval_timeout = 15.0  # longer timeout during warmup (proxy still connecting)
         elapsed = 0.0
         while elapsed < _WARMUP_TIMEOUT:
-            title = await self._safe_evaluate(first_tab, "document.title")
+            title = await self._safe_evaluate(first_tab, "document.title", timeout=_warmup_eval_timeout)
             if not isinstance(title, str):
                 title = ""
             body_text = await self._safe_evaluate(
-                first_tab, "document.body ? document.body.innerText : ''"
+                first_tab, "document.body ? document.body.innerText : ''",
+                timeout=_warmup_eval_timeout,
             )
             if not isinstance(body_text, str):
                 body_text = ""
             is_chrome_error = await self._safe_evaluate(
                 first_tab,
-                "document.getElementById('main-frame-error') !== null"
+                "document.getElementById('main-frame-error') !== null",
+                timeout=_warmup_eval_timeout,
             )
             if (
                 is_chrome_error is True
