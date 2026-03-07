@@ -215,7 +215,7 @@ class HLTVClient:
         if proc is None or proc.returncode is not None:
             return False
         stale = time.monotonic() - self._last_eval_ok
-        if stale > self._config.evaluate_timeout * 2:
+        if stale > self._config.navigation_timeout * 2 + 5:
             logger.warning("Browser unresponsive: no eval success in %.0fs", stale)
             return False
         return True
