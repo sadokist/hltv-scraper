@@ -138,7 +138,11 @@ async def run_discovery(
             logger.info("Shutdown requested, stopping discovery at offset %d", offset)
             break
 
-        if offset in completed:
+        # In incremental mode, always fetch from offset 0 — new matches
+        # appear at the front and push older ones to higher offsets.
+        # The offset-skip optimization only applies to --full mode
+        # (resuming a crashed full re-discovery).
+        if not incremental and offset in completed:
             stats["pages_skipped"] += 1
             logger.debug("Skipping offset %d (already complete)", offset)
             continue
@@ -159,6 +163,7 @@ async def run_discovery(
             html = await client.fetch(
                 url,
                 ready_selector=".result-con",  # wait for JS-rendered match list
+                stable_selector=True,  # wait for entry count to stabilise
             )
 
             # 2. Parse
@@ -233,6 +238,20 @@ async def run_discovery(
                 stats["matches_found"],
             )
 
+        except ValueError:
+            # _wait_for_selector raises ValueError when the page loaded
+            # but has no .result-con elements — i.e. end of results.
+            if prev_page_count < config.results_per_page:
+                logger.info(
+                    "Offset %d: no results on loaded page "
+                    "(previous page had %d < %d). End of results reached.",
+                    offset, prev_page_count, config.results_per_page,
+                )
+                break
+            # Genuinely unexpected — no short page preceded this
+            logger.error("Offset %d: page loaded but no entries found", offset)
+            stats["errors"] += 1
+            raise
         except RuntimeError:
             raise  # Re-raise the zero-entries error
         except Exception as exc:

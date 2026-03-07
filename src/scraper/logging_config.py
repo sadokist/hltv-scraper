@@ -1,7 +1,8 @@
 """Logging configuration for the HLTV scraper pipeline.
 
-Provides dual console + file logging. Console shows INFO+ with concise
-timestamps; the log file captures DEBUG+ with full timestamps and logger names.
+Provides console + file + database logging. Console shows INFO+ with concise
+timestamps; the log file captures DEBUG+ with full timestamps and logger names;
+the database handler stores INFO+ for dashboard viewing.
 """
 
 import logging
@@ -9,8 +10,33 @@ from datetime import datetime
 from pathlib import Path
 
 
+class DbLogHandler(logging.Handler):
+    """Logging handler that writes records into the scraper_logs table.
+
+    Accepts a psycopg2 connection. Inserts are autocommit so they survive
+    crashes. Silently drops records if the DB write fails.
+    """
+
+    def __init__(self, conn, level: int = logging.INFO) -> None:
+        super().__init__(level)
+        self._conn = conn
+        # Enable autocommit on a separate connection for log writes
+        self._conn.autocommit = True
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO scraper_logs (level, logger, message) VALUES (%s, %s, %s)",
+                    (record.levelname, record.name, msg),
+                )
+        except Exception:
+            pass  # never let logging break the scraper
+
+
 def setup_logging(
-    data_dir: str = "data", console_level: int = logging.INFO
+    data_dir: str = "data", console_level: int = logging.INFO, db_conn=None
 ) -> Path:
     """Configure logging with console and file handlers.
 
@@ -60,6 +86,15 @@ def setup_logging(
         logging.Formatter("%(asctime)s %(levelname)-5s [%(name)s] %(message)s")
     )
     root.addHandler(file_handler)
+
+    # Database handler: INFO+ for dashboard viewing.
+    if db_conn is not None:
+        try:
+            db_handler = DbLogHandler(db_conn, level=logging.INFO)
+            db_handler.setFormatter(logging.Formatter("%(message)s"))
+            root.addHandler(db_handler)
+        except Exception:
+            root.warning("Failed to attach DB log handler")
 
     # Suppress noisy third-party loggers.
     logging.getLogger("nodriver").setLevel(logging.WARNING)

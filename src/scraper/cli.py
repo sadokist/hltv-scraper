@@ -48,8 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--end-offset",
         type=int,
-        default=25000,
-        help="End offset for results pagination, exclusive (default: 25000)",
+        default=100000,
+        help="End offset for results pagination, exclusive (default: 100000 — effectively unlimited, discovery stops on its own)",
     )
     parser.add_argument(
         "--full",
@@ -140,7 +140,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--per-match-timeout",
         type=float,
         default=None,
-        help="Hard timeout per match in seconds (default: 300)",
+        help="Hard timeout per match in seconds (default: 180)",
+    )
+    parser.add_argument(
+        "--skip-discovery",
+        action="store_true",
+        default=False,
+        help="Skip discovery phase — use existing scrape_queue (for resuming)",
     )
     return parser
 
@@ -199,7 +205,6 @@ async def async_main(args: argparse.Namespace) -> None:
     # 3. Config
     config_overrides = {
         "data_dir": args.data_dir,
-        "db_path": f"{args.data_dir}/hltv.db",
         "start_offset": args.start_offset,
         "max_offset": args.end_offset,
     }
@@ -241,9 +246,21 @@ async def async_main(args: argparse.Namespace) -> None:
     shutdown = ShutdownHandler()
     shutdown.install()
 
-    # 5. Database
-    db = Database(config.db_path)
+    # 5. Database (PostgreSQL)
+    db = Database()
     db.initialize()
+
+    # 5b. Attach DB log handler (separate connection for autocommit writes)
+    try:
+        import psycopg2
+        from scraper.logging_config import DbLogHandler
+        log_conn = psycopg2.connect(**db.dsn)
+        log_conn.autocommit = True
+        db_handler = DbLogHandler(log_conn)
+        db_handler.setFormatter(logging.Formatter("%(message)s"))
+        logging.getLogger().addHandler(db_handler)
+    except Exception:
+        logger.warning("Could not attach DB log handler")
 
     # 6. Repositories and storage
     match_repo = MatchRepository(db.conn)
@@ -285,26 +302,69 @@ async def async_main(args: argparse.Namespace) -> None:
             # v2: flat pool — each browser owns one match end-to-end.
             # Overlap discovery with browser warmup: start browser 1 first,
             # then run discovery + warm up remaining browsers in parallel.
-            first_proxy = proxies[0] if proxies else None
-            first_client = HLTVClient(config, proxy_url=first_proxy)
-            await first_client.start()
-            clients_to_close.append(first_client)
-            logger.info("Browser 1/%d ready (worker)", args.workers)
+            # Try first proxy, then direct if it fails.
+            # Build interleaved proxy sublists so each worker gets a
+            # non-overlapping set.  Worker 0 → [0,2,4,...], Worker 1 → [1,3,5,...].
+            # On each restart the worker rotates to its next proxy.
+            def _proxy_sublist(worker_idx: int) -> list[str]:
+                if not proxies:
+                    return []
+                return [proxies[j] for j in range(worker_idx, len(proxies), args.workers)]
+
+            first_proxy_list = _proxy_sublist(0)
+            first_proxy = first_proxy_list[0] if first_proxy_list else None
+            first_client = None
+            for proxy in ([first_proxy] if first_proxy else []) + [None]:
+                try:
+                    c = HLTVClient(config, proxy_urls=first_proxy_list or None, forwarder_port=18080)
+                    await c.start()
+                    first_client = c
+                    clients_to_close.append(c)
+                    logger.info(
+                        "Browser 1/%d ready (worker via %s, %d proxies in rotation)",
+                        args.workers,
+                        proxy or "direct",
+                        len(first_proxy_list),
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        "Browser 1 failed with %s: %s — trying next",
+                        proxy or "direct", e,
+                    )
+                    try:
+                        await c.close()
+                    except Exception:
+                        pass
+            if first_client is None:
+                raise RuntimeError("Could not start browser 1 (tried proxy + direct)")
 
             async def _warm_remaining():
                 """Start browsers 2..N with staggered delays."""
                 pool = []
                 for i in range(1, args.workers):
-                    proxy = proxies[i % len(proxies)] if proxies else None
-                    c = HLTVClient(config, proxy_url=proxy)
-                    await c.start()
-                    pool.append(c)
-                    clients_to_close.append(c)
-                    logger.info(
-                        "Browser %d/%d ready (worker%s)",
-                        i + 1, args.workers,
-                        f" via {proxy}" if proxy else "",
-                    )
+                    worker_proxies = _proxy_sublist(i)
+                    try:
+                        c = HLTVClient(config, proxy_urls=worker_proxies or None, forwarder_port=18080 + i)
+                        await c.start()
+                        pool.append(c)
+                        clients_to_close.append(c)
+                        logger.info(
+                            "Browser %d/%d ready (worker via %s, %d proxies in rotation)",
+                            i + 1, args.workers,
+                            worker_proxies[0] if worker_proxies else "direct",
+                            len(worker_proxies),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Browser %d/%d failed (%s): %s — skipping",
+                            i + 1, args.workers,
+                            worker_proxies[0] if worker_proxies else "direct", e,
+                        )
+                        try:
+                            await c.close()
+                        except Exception:
+                            pass
                     if i < args.workers - 1:
                         await asyncio.sleep(0.3)
                 return pool
@@ -312,20 +372,28 @@ async def async_main(args: argparse.Namespace) -> None:
             # Run discovery on first browser while warming up the rest
             warmup_task = asyncio.create_task(_warm_remaining())
 
-            from scraper.discovery import run_discovery
-            from scraper.pipeline import ShutdownHandler as _SH
-            disc_result = await run_discovery(
-                [first_client], discovery_repo, storage, config,
-                incremental=not args.full, shutdown=shutdown,
-            )
-            logger.info(
-                "Discovery complete — %d matches found",
-                disc_result.get("matches_found", 0),
-            )
+            if args.skip_discovery:
+                logger.info("Skipping discovery (--skip-discovery)")
+            else:
+                from scraper.discovery import run_discovery
+                from scraper.pipeline import ShutdownHandler as _SH
+                disc_result = await run_discovery(
+                    [first_client], discovery_repo, storage, config,
+                    incremental=not args.full, shutdown=shutdown,
+                )
+                logger.info(
+                    "Discovery complete — %d matches found",
+                    disc_result.get("matches_found", 0),
+                )
 
             # Wait for remaining browsers to finish warming up
             remaining = await warmup_task
             worker_pool = [first_client] + remaining
+
+            # Reset health timers so browsers idle during warmup
+            # don't trigger false "unresponsive" restarts.
+            for c in worker_pool:
+                c._last_eval_ok = time.monotonic()
 
             results = await run_pipeline_v2(
                 clients=worker_pool,

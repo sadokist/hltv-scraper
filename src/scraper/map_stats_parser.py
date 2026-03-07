@@ -123,6 +123,19 @@ def parse_map_stats(html: str, mapstatsid: int) -> MapStats:
         metadata["team_right_id"],
     )
 
+    # Validate round count against score
+    expected_rounds = metadata["team_left_score"] + metadata["team_right_score"]
+    if len(rounds) != expected_rounds:
+        logger.warning(
+            "Mapstats %d: round count mismatch — expected %d (score %d:%d), "
+            "got %d rounds",
+            mapstatsid,
+            expected_rounds,
+            metadata["team_left_score"],
+            metadata["team_right_score"],
+            len(rounds),
+        )
+
     return MapStats(
         mapstatsid=mapstatsid,
         team_left_id=metadata["team_left_id"],

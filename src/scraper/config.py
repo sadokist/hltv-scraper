@@ -28,7 +28,7 @@ class ScraperConfig:
     max_backoff: float = 30.0
 
     # tenacity stop_after_attempt
-    max_retries: int = 5
+    max_retries: int = 4
 
     # Seconds to wait after navigation for page to load (fallback retries).
     # Ready-selector polling is the real gate; this is only used for
@@ -51,8 +51,8 @@ class ScraperConfig:
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
     evaluate_timeout: float = 15.0
 
-    # Hard ceiling per match — defense-in-depth (5 minutes)
-    per_match_timeout: float = 300.0
+    # Hard ceiling per match — defense-in-depth (2 minutes)
+    per_match_timeout: float = 120.0
 
     # Seconds to poll for Cloudflare challenge to clear during fetches
     challenge_wait: float = 90.0
@@ -60,9 +60,8 @@ class ScraperConfig:
     # HLTV base URL (single-site scraper)
     base_url: str = HLTV_BASE_URL
 
-    # Persistent data storage
+    # Persistent data storage (HTML archive, logs)
     data_dir: str = "data"
-    db_path: str = "data/hltv.db"
 
     # Discovery pagination
     game_type: str = "CS2"           # Game filter: CS2, CSGO, or CS16

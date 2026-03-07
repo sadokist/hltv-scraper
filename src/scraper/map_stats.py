@@ -67,7 +67,11 @@ async def run_map_stats(
         config.base_url + MAP_STATS_URL_TEMPLATE.format(mapstatsid=entry["mapstatsid"])
         for entry in pending
     ]
-    results = await fetch_distributed(clients, urls, ready_selector=".stats-table.totalstats td.st-player")
+    results = await fetch_distributed(
+        clients, urls,
+        ready_selector=".stats-table.totalstats td.st-player",
+        page_type="map_stats",
+    )
 
     fetched_entries: list[dict] = []
     for entry, result in zip(pending, results):

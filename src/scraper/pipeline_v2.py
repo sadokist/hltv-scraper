@@ -154,18 +154,11 @@ async def _scrape_match(
     if maps_q or vetoes_q:
         logger.warning("Match %d: quarantined %d maps, %d vetoes", match_id, maps_q, vetoes_q)
 
-    try:
-        match_repo.upsert_match_overview(
-            match_data=match_data,
-            maps_data=validated_maps,
-            vetoes_data=validated_vetoes,
-        )
-    except Exception as exc:
-        logger.error("Match %d upsert failed: %s", match_id, exc)
-        discovery_repo.update_status(match_id, "failed")
-        result["error"] = f"upsert: {exc}"
-        return result
-    logger.debug("Overview persisted for match %d (%s)", match_id, source_url)
+    # Overview data collected but NOT persisted yet — will be persisted
+    # atomically with all map data only if every stage succeeds.
+    maps_data = validated_maps
+    vetoes_data = validated_vetoes
+    logger.debug("Overview parsed for match %d (%s)", match_id, source_url)
 
     # ------------------------------------------------------------------ #
     # Stages B + C: parallel per-map fetching
@@ -173,25 +166,39 @@ async def _scrape_match(
     # Per-map pipeline: for each map, fetch stats → perf → econ back-to-back
     # on the same tab.  All maps run in parallel (staggered 0.1 s apart), so
     # a BO3 fires up to 3 concurrent tab pipelines at once.
+    #
+    # Nothing is persisted until ALL maps complete successfully.
     # ------------------------------------------------------------------ #
     if parsed.is_forfeit:
+        # Forfeits have no map data — persist overview only
+        match_repo.persist_complete_match(
+            match_data=match_data, maps_data=maps_data,
+            vetoes_data=vetoes_data, all_stats=[], all_rounds=[],
+            all_economy=[], all_kill_matrix=[],
+        )
         result["ok"] = True
         return result
 
     playable = [m for m in parsed.maps if m.mapstatsid]
     if not playable:
+        match_repo.persist_complete_match(
+            match_data=match_data, maps_data=maps_data,
+            vetoes_data=vetoes_data, all_stats=[], all_rounds=[],
+            all_economy=[], all_kill_matrix=[],
+        )
         result["ok"] = True
         return result
 
-    # Pre-fetch team resolution data once (used in every perf/econ stage)
-    match_row = match_repo.get_match(match_id) or {}
+    # Team name→id mapping for economy data (resolved from overview)
+    match_row = match_data
     team_name_to_id = {
-        match_row.get("team1_name"): match_row.get("team1_id"),
-        match_row.get("team2_name"): match_row.get("team2_id"),
+        match_data.get("team1_name"): match_data.get("team1_id"),
+        match_data.get("team2_name"): match_data.get("team2_id"),
     }
 
     # ---- Stage B helper ------------------------------------------------
-    async def fetch_map_stats_one(m, tab=None) -> bool:
+    async def fetch_map_stats_one(m, tab=None) -> dict | None:
+        """Fetch and parse map stats. Returns collected data dict or None on failure."""
         mapstatsid = m.mapstatsid
         map_number = m.map_number
         map_url    = base + _MAP_STATS_URL.format(mapstatsid=mapstatsid)
@@ -203,25 +210,22 @@ async def _scrape_match(
                 map_html = await client.fetch(
                     map_url, page_type="map_stats", ready_selector=".stats-table")
         except ValueError as exc:
-            # Page loaded but .stats-table not found — no stats data available
             logger.warning("Map %d fetch: no data (%s)", mapstatsid, exc)
-            return False
+            return None
         except Exception as exc:
             logger.error("Map %d fetch: %s", mapstatsid, exc)
-            return False
+            return None
 
         await async_save(map_html, match_id=match_id,
                          mapstatsid=mapstatsid, page_type="map_stats")
         try:
             map_parsed = parse_map_stats(map_html, mapstatsid)
         except ValueError as exc:
-            # Expected: page exists but lacks required elements (e.g. forfeit,
-            # very old match, or HLTV-side data gap).  Not a scraper bug.
             logger.warning("Map %d parse: %s", mapstatsid, exc)
-            return False
+            return None
         except Exception as exc:
             logger.error("Map %d parse: %s", mapstatsid, exc)
-            return False
+            return None
 
         ts = now()
         stats_data = [
@@ -258,20 +262,23 @@ async def _scrape_match(
             }
             for ro in map_parsed.rounds
         ]
-        match_repo.upsert_map_stats_complete(stats_data=stats_data, rounds_data=rounds_data)
-        logger.info("Parsed and persisted mapstatsid %d (match %d, map %d)",
+        logger.info("Fetched mapstatsid %d (match %d, map %d)",
                     mapstatsid, match_id, map_number)
-        return True
+        return {"stats": stats_data, "rounds": rounds_data}
 
     # ---- Stage C helper ------------------------------------------------
-    async def fetch_perf_econ_one(m, tab=None) -> bool:
+    async def fetch_perf_econ_one(m, stats_lookup: dict, round_numbers: set, tab=None) -> dict | None:
+        """Fetch and parse perf+econ. Returns collected data dict or None on failure.
+
+        Args:
+            stats_lookup: {player_id: stats_dict} from stage B for in-memory merge.
+            round_numbers: set of valid round numbers from stage B round_history.
+        """
         mapstatsid = m.mapstatsid
         map_number = m.map_number
         perf_url   = base + _PERF_URL.format(mapstatsid=mapstatsid)
         econ_url   = base + _ECON_URL.format(mapstatsid=mapstatsid)
 
-        # Fetch perf then econ sequentially on the same tab (or any free tab).
-        # Targeted extraction: ~50–100 KB instead of 5–12 MB per fetch.
         try:
             if tab is not None:
                 perf_html = await client.fetch_with_tab(
@@ -286,15 +293,12 @@ async def _scrape_match(
                 econ_html = await client.fetch(econ_url, page_type="map_economy",
                                                ready_selector="[data-fusionchart-config]")
         except ValueError as exc:
-            # Page loaded but no data (e.g. no player stats for this event).
             logger.warning("Map %d perf/econ: no data on page (%s)", mapstatsid, exc)
-            match_repo.increment_perf_attempts(match_id, map_number)
-            return False
+            return None
         except Exception as exc:
             logger.error("Map %d perf/econ fetch: %s", mapstatsid, exc)
-            return False
+            return None
 
-        # Fire both saves concurrently in the thread pool (non-blocking)
         await asyncio.gather(
             async_save(perf_html, match_id=match_id,
                        mapstatsid=mapstatsid, page_type="map_performance"),
@@ -306,66 +310,57 @@ async def _scrape_match(
             perf_parsed = parse_performance(perf_html, mapstatsid)
             econ_parsed = parse_economy(econ_html, mapstatsid)
         except ValueError as exc:
-            # Expected for matches where HLTV doesn't publish perf/econ data
-            # (e.g. some lower-tier events). Increment attempt counter so
-            # incremental runs don't retry this map beyond max_attempts.
             logger.warning("Map %d perf/econ: no data available (%s)", mapstatsid, exc)
-            match_repo.increment_perf_attempts(match_id, map_number)
-            return False
+            return None
         except Exception as exc:
             logger.error("Map %d perf/econ parse: %s", mapstatsid, exc)
-            match_repo.increment_perf_attempts(match_id, map_number)
-            return False
+            return None
 
-        ts       = now()
-        existing = {s["player_id"]: s for s in
-                    match_repo.get_player_stats(match_id, map_number)}
-
+        ts = now()
+        # Merge basic stats (from stage B in-memory) with perf fields
         perf_stats = [
             {
                 "match_id": match_id, "map_number": map_number,
                 "player_id": p.player_id,
-                "player_name": existing.get(p.player_id, {}).get("player_name", p.player_name),
-                "team_id":          existing.get(p.player_id, {}).get("team_id"),
-                "kills":            existing.get(p.player_id, {}).get("kills"),
-                "deaths":           existing.get(p.player_id, {}).get("deaths"),
-                "assists":          existing.get(p.player_id, {}).get("assists"),
-                "flash_assists":    existing.get(p.player_id, {}).get("flash_assists"),
-                "hs_kills":         existing.get(p.player_id, {}).get("hs_kills"),
-                "kd_diff":          existing.get(p.player_id, {}).get("kd_diff"),
-                "adr":              existing.get(p.player_id, {}).get("adr"),
-                "kast":             existing.get(p.player_id, {}).get("kast"),
-                "fk_diff":          existing.get(p.player_id, {}).get("fk_diff"),
-                "rating":           existing.get(p.player_id, {}).get("rating"),
+                "player_name": stats_lookup.get(p.player_id, {}).get("player_name", p.player_name),
+                "team_id":          stats_lookup.get(p.player_id, {}).get("team_id"),
+                "kills":            stats_lookup.get(p.player_id, {}).get("kills"),
+                "deaths":           stats_lookup.get(p.player_id, {}).get("deaths"),
+                "assists":          stats_lookup.get(p.player_id, {}).get("assists"),
+                "flash_assists":    stats_lookup.get(p.player_id, {}).get("flash_assists"),
+                "hs_kills":         stats_lookup.get(p.player_id, {}).get("hs_kills"),
+                "kd_diff":          stats_lookup.get(p.player_id, {}).get("kd_diff"),
+                "adr":              stats_lookup.get(p.player_id, {}).get("adr"),
+                "kast":             stats_lookup.get(p.player_id, {}).get("kast"),
+                "fk_diff":          stats_lookup.get(p.player_id, {}).get("fk_diff"),
+                "rating":           stats_lookup.get(p.player_id, {}).get("rating"),
                 "kpr": p.kpr, "dpr": p.dpr, "mk_rating": p.mk_rating,
-                "opening_kills":    existing.get(p.player_id, {}).get("opening_kills"),
-                "opening_deaths":   existing.get(p.player_id, {}).get("opening_deaths"),
-                "multi_kills":      existing.get(p.player_id, {}).get("multi_kills"),
-                "clutch_wins":      existing.get(p.player_id, {}).get("clutch_wins"),
-                "traded_deaths":    existing.get(p.player_id, {}).get("traded_deaths"),
-                "round_swing":      existing.get(p.player_id, {}).get("round_swing"),
-                "e_kills":          existing.get(p.player_id, {}).get("e_kills"),
-                "e_deaths":         existing.get(p.player_id, {}).get("e_deaths"),
-                "e_hs_kills":       existing.get(p.player_id, {}).get("e_hs_kills"),
-                "e_kd_diff":        existing.get(p.player_id, {}).get("e_kd_diff"),
-                "e_adr":            existing.get(p.player_id, {}).get("e_adr"),
-                "e_kast":           existing.get(p.player_id, {}).get("e_kast"),
-                "e_opening_kills":  existing.get(p.player_id, {}).get("e_opening_kills"),
-                "e_opening_deaths": existing.get(p.player_id, {}).get("e_opening_deaths"),
-                "e_fk_diff":        existing.get(p.player_id, {}).get("e_fk_diff"),
-                "e_traded_deaths":  existing.get(p.player_id, {}).get("e_traded_deaths"),
+                "opening_kills":    stats_lookup.get(p.player_id, {}).get("opening_kills"),
+                "opening_deaths":   stats_lookup.get(p.player_id, {}).get("opening_deaths"),
+                "multi_kills":      stats_lookup.get(p.player_id, {}).get("multi_kills"),
+                "clutch_wins":      stats_lookup.get(p.player_id, {}).get("clutch_wins"),
+                "traded_deaths":    stats_lookup.get(p.player_id, {}).get("traded_deaths"),
+                "round_swing":      stats_lookup.get(p.player_id, {}).get("round_swing"),
+                "e_kills":          stats_lookup.get(p.player_id, {}).get("e_kills"),
+                "e_deaths":         stats_lookup.get(p.player_id, {}).get("e_deaths"),
+                "e_hs_kills":       stats_lookup.get(p.player_id, {}).get("e_hs_kills"),
+                "e_kd_diff":        stats_lookup.get(p.player_id, {}).get("e_kd_diff"),
+                "e_adr":            stats_lookup.get(p.player_id, {}).get("e_adr"),
+                "e_kast":           stats_lookup.get(p.player_id, {}).get("e_kast"),
+                "e_opening_kills":  stats_lookup.get(p.player_id, {}).get("e_opening_kills"),
+                "e_opening_deaths": stats_lookup.get(p.player_id, {}).get("e_opening_deaths"),
+                "e_fk_diff":        stats_lookup.get(p.player_id, {}).get("e_fk_diff"),
+                "e_traded_deaths":  stats_lookup.get(p.player_id, {}).get("e_traded_deaths"),
                 "scraped_at": ts, "source_url": perf_url,
                 "parser_version": _PERF_ECON_PARSER,
             }
             for p in perf_parsed.players
         ]
 
-        econ_t1_id = team_name_to_id.get(econ_parsed.team1_name) or match_row.get("team1_id")
-        econ_t2_id = team_name_to_id.get(econ_parsed.team2_name) or match_row.get("team2_id")
-        valid_rounds = match_repo.get_valid_round_numbers(match_id, map_number)
+        econ_t1_id = team_name_to_id.get(econ_parsed.team1_name) or match_data.get("team1_id")
         economy_data = []
         for r in econ_parsed.rounds:
-            if r.round_number not in valid_rounds:
+            if r.round_number not in round_numbers:
                 continue
             t_id = team_name_to_id.get(r.team_name) or econ_t1_id
             economy_data.append({
@@ -388,45 +383,86 @@ async def _scrape_match(
             for k in perf_parsed.kill_matrix
         ]
 
-        match_repo.upsert_perf_economy_complete(
-            perf_stats=perf_stats,
-            economy_data=economy_data,
-            kill_matrix_data=kill_matrix_data,
-        )
         logger.info(
-            "Parsed and persisted mapstatsid %d (match %d, map %d): "
-            "%d player_stats, %d economy rows, %d kill_matrix entries (%s)",
+            "Fetched perf/econ mapstatsid %d (match %d, map %d): "
+            "%d player_stats, %d economy rows, %d kill_matrix entries",
             mapstatsid, match_id, map_number,
-            len(perf_stats), len(economy_data), len(kill_matrix_data), perf_url,
+            len(perf_stats), len(economy_data), len(kill_matrix_data),
         )
-        return True
+        return {"stats": perf_stats, "economy": economy_data, "kill_matrix": kill_matrix_data}
 
-    async def scrape_map_pipeline(i: int, m) -> bool:
+    async def scrape_map_pipeline(i: int, m) -> dict | None:
         """Run B→C for one map on a single pinned tab.
 
-        Minimal stagger (20ms) — nav_lock handles serialisation.
+        Returns dict with all collected data, or None if any stage failed.
         """
         if i > 0:
             await asyncio.sleep(i * 0.02)
         async with client.pinned_tab() as tab:
-            b_ok = await fetch_map_stats_one(m, tab)
-            if not b_ok:
-                return False
-            return await fetch_perf_econ_one(m, tab)
+            b_data = await fetch_map_stats_one(m, tab)
+            if b_data is None:
+                return None
+            # Build lookup for in-memory merge (replaces DB query)
+            stats_lookup = {s["player_id"]: s for s in b_data["stats"]}
+            round_numbers = {r["round_number"] for r in b_data["rounds"]}
+            c_data = await fetch_perf_econ_one(m, stats_lookup, round_numbers, tab)
+            if c_data is None:
+                return None
+            return {
+                "map_stats": b_data["stats"],
+                "rounds": b_data["rounds"],
+                "perf_stats": c_data["stats"],
+                "economy": c_data["economy"],
+                "kill_matrix": c_data["kill_matrix"],
+            }
 
     # ---- Stages B + C: pipelined per-map --------------------------------
-    # Each map runs stats → perf/econ back-to-back on its own tab.
-    # Maps are staggered 0.1 s apart to avoid simultaneous CDP navigation.
-    # As soon as a map's stats fetch completes it immediately starts
-    # perf/econ — no waiting for the other maps' stats to finish first.
     bc_results = await asyncio.gather(
         *[scrape_map_pipeline(i, m) for i, m in enumerate(playable)],
         return_exceptions=True,
     )
-    maps_done = sum(1 for r in bc_results if r is True)
 
-    result["maps_done"] = maps_done
+    # Check if ALL maps succeeded
+    maps_failed = [
+        m.mapstatsid for m, r in zip(playable, bc_results)
+        if not isinstance(r, dict)
+    ]
+
+    if maps_failed:
+        result["ok"] = False
+        result["maps_done"] = 0
+        result["error"] = f"{len(maps_failed)}/{len(playable)} maps failed (mapstatsids: {maps_failed})"
+        logger.warning("Match %d incomplete: %d/%d maps failed %s",
+                       match_id, len(maps_failed), len(playable), maps_failed)
+        return result
+
+    # All maps succeeded — persist everything atomically
+    all_stats = []
+    all_rounds = []
+    all_economy = []
+    all_kill_matrix = []
+    for r in bc_results:
+        # perf_stats is the merged version (basic + perf fields) — use it
+        # instead of map_stats to avoid duplicate inserts
+        all_stats.extend(r["perf_stats"])
+        all_rounds.extend(r["rounds"])
+        all_economy.extend(r["economy"])
+        all_kill_matrix.extend(r["kill_matrix"])
+
+    match_repo.persist_complete_match(
+        match_data=match_data,
+        maps_data=maps_data,
+        vetoes_data=vetoes_data,
+        all_stats=all_stats,
+        all_rounds=all_rounds,
+        all_economy=all_economy,
+        all_kill_matrix=all_kill_matrix,
+    )
     result["ok"] = True
+    result["maps_done"] = len(playable)
+    logger.info("Persisted match %d: %d maps, %d stats, %d rounds, %d economy, %d kill_matrix",
+                match_id, len(playable), len(all_stats), len(all_rounds),
+                len(all_economy), len(all_kill_matrix))
     return result
 
 
@@ -509,7 +545,10 @@ async def run_pipeline_v2(
     counters = {"done": 0, "failed": 0}
     # Per-client consecutive timeout tracker for circuit-breaker restarts
     client_timeouts: dict[int, int] = {id(c): 0 for c in clients}
-    _TIMEOUT_RESTART_THRESHOLD = 3
+    _TIMEOUT_RESTART_THRESHOLD = 2
+    # Per-client match counter for proactive proxy rotation
+    client_match_count: dict[int, int] = {id(c): 0 for c in clients}
+    _PROXY_ROTATE_EVERY = 15
     t0 = time.monotonic()
 
     async def process_one(entry: dict) -> None:
@@ -564,6 +603,7 @@ async def run_pipeline_v2(
 
             # Success — reset timeout counter for this client
             client_timeouts[id(client)] = 0
+            client_match_count[id(client)] = client_match_count.get(id(client), 0) + 1
 
             if r["ok"]:
                 discovery_repo.update_status(entry["match_id"], "scraped")
@@ -574,7 +614,17 @@ async def run_pipeline_v2(
                 logger.info("[%d/%d] Match %d complete (%d maps)",
                             counters["done"] + counters["failed"], total,
                             entry["match_id"], r["maps_done"])
+
+                # Proactive proxy rotation every N matches
+                if (client_match_count[id(client)] % _PROXY_ROTATE_EVERY == 0
+                        and hasattr(client, '_proxy_urls') and client._proxy_urls):
+                    try:
+                        await client.restart()
+                        client_timeouts[id(client)] = 0
+                    except Exception:
+                        logger.error("Proactive proxy rotation restart failed")
             else:
+                discovery_repo.update_status(entry["match_id"], "failed")
                 counters["failed"] += 1
                 results["overview"]["failed"] += 1
                 logger.warning("[%d/%d] Match %d failed: %s",

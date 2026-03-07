@@ -1,67 +1,243 @@
-"""SQLite database connection manager with migration support.
+"""PostgreSQL database connection manager with schema initialization.
 
-Manages the connection lifecycle, applies PRAGMAs (WAL, foreign keys,
-busy_timeout) on every connect, and runs pending SQL migrations from
-the migrations/ directory using PRAGMA user_version for tracking.
+Manages the connection lifecycle and applies the schema DDL on first run.
 """
 
-import sqlite3
-from pathlib import Path
+import logging
+import os
+
+import psycopg2
+import psycopg2.extras
+
+logger = logging.getLogger(__name__)
+
+# Default connection parameters (override via env vars or constructor)
+DEFAULT_DSN = {
+    "host": os.getenv("HLTV_DB_HOST", "127.0.0.1"),
+    "port": int(os.getenv("HLTV_DB_PORT", "5433")),
+    "dbname": os.getenv("HLTV_DB_NAME", "HLTV-Historical-Data"),
+    "user": os.getenv("HLTV_DB_USER", "hltv"),
+    "password": os.getenv("HLTV_DB_PASSWORD", "hltv"),
+}
+
+SCHEMA_DDL = """
+CREATE TABLE IF NOT EXISTS matches (
+    match_id      INTEGER PRIMARY KEY,
+    date          TEXT,
+    event_id      INTEGER,
+    event_name    TEXT,
+    team1_id      INTEGER,
+    team1_name    TEXT,
+    team2_id      INTEGER,
+    team2_name    TEXT,
+    team1_score   INTEGER,
+    team2_score   INTEGER,
+    best_of       INTEGER,
+    is_lan        INTEGER,
+    match_url     TEXT,
+    scraped_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    source_url    TEXT,
+    parser_version TEXT,
+    date_unix_ms  BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS maps (
+    match_id        INTEGER NOT NULL REFERENCES matches(match_id),
+    map_number      INTEGER NOT NULL,
+    mapstatsid      INTEGER,
+    map_name        TEXT,
+    team1_rounds    INTEGER,
+    team2_rounds    INTEGER,
+    team1_ct_rounds INTEGER,
+    team1_t_rounds  INTEGER,
+    team2_ct_rounds INTEGER,
+    team2_t_rounds  INTEGER,
+    scraped_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    source_url      TEXT,
+    parser_version  TEXT,
+    perf_attempts   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (match_id, map_number)
+);
+
+CREATE TABLE IF NOT EXISTS player_stats (
+    match_id       INTEGER NOT NULL,
+    map_number     INTEGER NOT NULL,
+    player_id      INTEGER NOT NULL,
+    player_name    TEXT,
+    team_id        INTEGER,
+    kills          INTEGER,
+    deaths         INTEGER,
+    assists        INTEGER,
+    flash_assists  INTEGER,
+    hs_kills       INTEGER,
+    kd_diff        INTEGER,
+    adr            REAL,
+    kast           REAL,
+    fk_diff        INTEGER,
+    rating         REAL,
+    kpr            REAL,
+    dpr            REAL,
+    opening_kills  INTEGER,
+    opening_deaths INTEGER,
+    multi_kills    INTEGER,
+    clutch_wins    INTEGER,
+    traded_deaths  INTEGER,
+    round_swing    REAL,
+    mk_rating      REAL,
+    scraped_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL DEFAULT '',
+    source_url     TEXT,
+    parser_version TEXT,
+    e_kills        INTEGER,
+    e_deaths       INTEGER,
+    e_hs_kills     INTEGER,
+    e_kd_diff      INTEGER,
+    e_adr          REAL,
+    e_kast         REAL,
+    e_opening_kills  INTEGER,
+    e_opening_deaths INTEGER,
+    e_fk_diff      INTEGER,
+    e_traded_deaths  INTEGER,
+    PRIMARY KEY (match_id, map_number, player_id),
+    FOREIGN KEY (match_id) REFERENCES matches(match_id),
+    FOREIGN KEY (match_id, map_number) REFERENCES maps(match_id, map_number)
+);
+
+CREATE TABLE IF NOT EXISTS round_history (
+    match_id       INTEGER NOT NULL,
+    map_number     INTEGER NOT NULL,
+    round_number   INTEGER NOT NULL,
+    winner_side    TEXT,
+    win_type       TEXT,
+    winner_team_id INTEGER,
+    scraped_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    source_url     TEXT,
+    parser_version TEXT,
+    PRIMARY KEY (match_id, map_number, round_number),
+    FOREIGN KEY (match_id, map_number) REFERENCES maps(match_id, map_number)
+);
+
+CREATE TABLE IF NOT EXISTS economy (
+    match_id        INTEGER NOT NULL,
+    map_number      INTEGER NOT NULL,
+    round_number    INTEGER NOT NULL,
+    team_id         INTEGER NOT NULL,
+    equipment_value INTEGER,
+    buy_type        TEXT,
+    scraped_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    source_url      TEXT,
+    parser_version  TEXT,
+    PRIMARY KEY (match_id, map_number, round_number, team_id),
+    FOREIGN KEY (match_id, map_number, round_number)
+        REFERENCES round_history(match_id, map_number, round_number)
+);
+
+CREATE TABLE IF NOT EXISTS kill_matrix (
+    match_id       INTEGER NOT NULL,
+    map_number     INTEGER NOT NULL,
+    matrix_type    TEXT NOT NULL,
+    player1_id     INTEGER NOT NULL,
+    player2_id     INTEGER NOT NULL,
+    player1_kills  INTEGER NOT NULL,
+    player2_kills  INTEGER NOT NULL,
+    scraped_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    source_url     TEXT,
+    parser_version TEXT,
+    PRIMARY KEY (match_id, map_number, matrix_type, player1_id, player2_id),
+    FOREIGN KEY (match_id, map_number) REFERENCES maps(match_id, map_number)
+);
+
+CREATE TABLE IF NOT EXISTS vetoes (
+    match_id       INTEGER NOT NULL REFERENCES matches(match_id),
+    step_number    INTEGER NOT NULL,
+    team_name      TEXT,
+    action         TEXT NOT NULL,
+    map_name       TEXT NOT NULL,
+    scraped_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    source_url     TEXT,
+    parser_version TEXT,
+    PRIMARY KEY (match_id, step_number)
+);
+
+CREATE TABLE IF NOT EXISTS quarantine (
+    id              SERIAL PRIMARY KEY,
+    entity_type     TEXT NOT NULL,
+    match_id        INTEGER,
+    map_number      INTEGER,
+    raw_data        TEXT NOT NULL,
+    error_details   TEXT NOT NULL,
+    quarantined_at  TEXT NOT NULL,
+    resolved        INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS scrape_queue (
+    match_id      INTEGER PRIMARY KEY,
+    url           TEXT NOT NULL,
+    "offset"      INTEGER NOT NULL,
+    discovered_at TEXT NOT NULL,
+    is_forfeit    INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL DEFAULT 'pending'
+);
+
+CREATE TABLE IF NOT EXISTS discovery_progress (
+    "offset"     INTEGER PRIMARY KEY,
+    completed_at TEXT NOT NULL
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(date);
+CREATE INDEX IF NOT EXISTS idx_matches_event ON matches(event_id);
+CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(team1_id, team2_id);
+CREATE INDEX IF NOT EXISTS idx_maps_mapstatsid ON maps(mapstatsid);
+CREATE INDEX IF NOT EXISTS idx_player_stats_player ON player_stats(player_id);
+CREATE INDEX IF NOT EXISTS idx_player_stats_team ON player_stats(team_id);
+CREATE INDEX IF NOT EXISTS idx_kill_matrix_players ON kill_matrix(player1_id, player2_id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_match ON quarantine(match_id);
+CREATE INDEX IF NOT EXISTS idx_quarantine_resolved ON quarantine(resolved);
+CREATE INDEX IF NOT EXISTS idx_quarantine_type ON quarantine(entity_type);
+CREATE INDEX IF NOT EXISTS idx_scrape_queue_offset ON scrape_queue("offset");
+CREATE INDEX IF NOT EXISTS idx_scrape_queue_status ON scrape_queue(status);
+
+CREATE TABLE IF NOT EXISTS scraper_logs (
+    id          SERIAL PRIMARY KEY,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    level       TEXT NOT NULL,
+    logger      TEXT,
+    message     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scraper_logs_ts ON scraper_logs(ts DESC);
+"""
 
 
 class Database:
-    """SQLite connection manager with migration support.
+    """PostgreSQL connection manager.
 
     Usage::
 
-        db = Database("data/hltv.db")
-        db.initialize()  # connect + apply migrations
+        db = Database()
+        db.initialize()  # connect + create schema
         # ... use db.conn ...
         db.close()
-
-    Or as a context manager::
-
-        with Database("data/hltv.db") as db:
-            db.apply_migrations()
-            # ... use db.conn ...
     """
 
-    def __init__(self, db_path: str | Path) -> None:
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: sqlite3.Connection | None = None
+    def __init__(self, dsn: dict | None = None, **kwargs) -> None:
+        self.dsn = {**DEFAULT_DSN, **(dsn or {}), **kwargs}
+        self._conn = None
 
-    def connect(self) -> sqlite3.Connection:
-        """Open connection and configure PRAGMAs.
-
-        Sets WAL journal mode, enables foreign keys, and configures
-        a 5-second busy timeout for lock contention.
-        """
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            detect_types=sqlite3.PARSE_DECLTYPES,
-        )
-        self._conn.row_factory = sqlite3.Row
-        # PRAGMAs must be set per-connection
-        self._conn.execute("PRAGMA journal_mode = WAL")
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        # NORMAL is safe with WAL and avoids the full fsync on every commit
-        self._conn.execute("PRAGMA synchronous = NORMAL")
-        # 32 MB page cache — reduces I/O for repeated UPSERT lookups
-        self._conn.execute("PRAGMA cache_size = -32000")
-        # Store temp tables/indices in memory
-        self._conn.execute("PRAGMA temp_store = MEMORY")
-        # 30s busy timeout — enough for 8 workers to queue up without errors
-        self._conn.execute("PRAGMA busy_timeout = 30000")
-        # Memory-mapped I/O: 256 MB — speeds up sequential read scans
-        self._conn.execute("PRAGMA mmap_size = 268435456")
-        # Increase WAL checkpoint interval to 10 000 pages (was 1 000)
-        # so auto-checkpoints happen less often, reducing write I/O spikes
-        self._conn.execute("PRAGMA wal_autocheckpoint = 10000")
+    def connect(self):
+        """Open connection to PostgreSQL."""
+        self._conn = psycopg2.connect(**self.dsn)
+        self._conn.autocommit = False
         return self._conn
 
     @property
-    def conn(self) -> sqlite3.Connection:
+    def conn(self):
         """Return the active connection or raise if not connected."""
         if self._conn is None:
             raise RuntimeError("Database not connected. Call connect() first.")
@@ -73,62 +249,18 @@ class Database:
             self._conn.close()
             self._conn = None
 
-    def __enter__(self) -> "Database":
+    def __enter__(self):
         self.connect()
         return self
 
-    def __exit__(self, *args: object) -> None:
+    def __exit__(self, *args) -> None:
         self.close()
 
-    def get_schema_version(self) -> int:
-        """Return the current schema version (PRAGMA user_version)."""
-        return self.conn.execute("PRAGMA user_version").fetchone()[0]
-
-    def apply_migrations(self, migrations_dir: Path | None = None) -> int:
-        """Apply pending SQL migration files.
-
-        Migration files are named ``NNN_description.sql`` where NNN is
-        the version number.  Files with version <= current user_version
-        are skipped.  After each file is applied, user_version is set
-        to the file's version number.
-
-        Args:
-            migrations_dir: Directory containing .sql files.
-                Defaults to ``<project_root>/migrations``.
-
-        Returns:
-            Number of migrations applied.
-        """
-        if migrations_dir is None:
-            migrations_dir = Path(__file__).resolve().parent.parent.parent / "migrations"
-        else:
-            migrations_dir = Path(migrations_dir)
-
-        current = self.get_schema_version()
-        migration_files = sorted(migrations_dir.glob("*.sql"))
-        applied = 0
-
-        for migration_file in migration_files:
-            # Extract version number from filename: 001_initial.sql -> 1
-            version = int(migration_file.name.split("_")[0])
-            if version <= current:
-                continue
-
-            sql = migration_file.read_text(encoding="utf-8")
-            self.conn.executescript(sql)
-            self.conn.execute(f"PRAGMA user_version = {version}")
-            applied += 1
-
-        return applied
-
-    def initialize(self) -> sqlite3.Connection:
-        """Connect and apply all pending migrations.
-
-        This is the standard entry point for application code.
-
-        Returns:
-            The active sqlite3.Connection.
-        """
+    def initialize(self):
+        """Connect and create schema if needed."""
         self.connect()
-        self.apply_migrations()
-        return self.conn
+        with self._conn:
+            with self._conn.cursor() as cur:
+                cur.execute(SCHEMA_DDL)
+        logger.info("Database schema initialized")
+        return self._conn

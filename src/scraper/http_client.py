@@ -24,6 +24,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import urlparse
 
 import nodriver
 
@@ -156,12 +157,22 @@ class HLTVClient:
             results = await client.fetch_many(["url1", "url2", "url3"])
     """
 
-    def __init__(self, config: ScraperConfig | None = None, proxy_url: str | None = None):
+    def __init__(
+        self,
+        config: ScraperConfig | None = None,
+        proxy_url: str | None = None,
+        proxy_urls: list[str] | None = None,
+        forwarder_port: int = 18080,
+    ):
         if config is None:
             config = ScraperConfig()
 
         self._config = config
-        self._proxy_url = proxy_url
+        # Proxy rotation: cycle through the list on each start()/restart().
+        # If proxy_urls is provided, proxy_url is ignored.
+        self._proxy_urls = proxy_urls or ([proxy_url] if proxy_url else [])
+        self._proxy_index = 0
+        self._apply_proxy(self._proxy_urls[0] if self._proxy_urls else None)
         self.rate_limiter = RateLimiter(config)  # kept for global backoff/stats
         self._tab_rate_limiters: dict[int, RateLimiter] = {}  # per-tab, keyed by id(tab)
         self._browser: nodriver.Browser | None = None
@@ -177,6 +188,8 @@ class HLTVClient:
         self._request_count = 0
         self._success_count = 0
         self._challenge_count = 0
+        self._proxy_forwarder = None
+        self._forwarder_port = forwarder_port  # unique per worker
 
         # Track last successful CDP evaluate for unresponsiveness detection
         self._last_eval_ok: float = time.monotonic()
@@ -207,18 +220,65 @@ class HLTVClient:
             return False
         return True
 
-    async def restart(self) -> None:
-        """Close and re-start the browser (crash recovery).
+    def _apply_proxy(self, proxy_url: str | None) -> None:
+        """Set the active proxy URL, parsing credentials."""
+        self._proxy_url, self._proxy_user, self._proxy_pass = self._parse_proxy(proxy_url)
 
-        Preserves the same config/proxy. The caller should retry
-        the failed match after calling this.
+    def _rotate_proxy(self) -> None:
+        """Advance to the next proxy in the list (round-robin)."""
+        if not self._proxy_urls:
+            return
+        self._proxy_index = (self._proxy_index + 1) % len(self._proxy_urls)
+        self._apply_proxy(self._proxy_urls[self._proxy_index])
+        logger.info("Rotated to proxy %d/%d: %s",
+                     self._proxy_index + 1, len(self._proxy_urls),
+                     self._proxy_url)
+
+    async def restart(self) -> None:
+        """Close and re-start the browser with the next proxy.
+
+        Rotates to a fresh proxy IP on each restart to distribute
+        load and avoid Cloudflare IP-level throttling.
         """
-        logger.warning("Restarting browser (crash recovery)...")
+        self._rotate_proxy()
+        logger.warning("Restarting browser (proxy rotation)...")
         await self.close()
         self._nav_lock = None  # set in start() based on tab count
         self._last_eval_ok = time.monotonic()  # reset staleness timer
         await self.start()
         logger.info("Browser restarted successfully")
+
+    @staticmethod
+    def _parse_proxy(proxy_url: str | None) -> tuple[str | None, str | None, str | None]:
+        """Parse proxy URL, extracting credentials if present.
+
+        Supports: socks5://user:pass@host:port, http://user:pass@host:port
+        Returns: (url_without_auth, username, password)
+        """
+        if not proxy_url:
+            return None, None, None
+        from urllib.parse import urlparse
+        parsed = urlparse(proxy_url)
+        if parsed.username:
+            # Rebuild URL without credentials
+            netloc = parsed.hostname
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            clean_url = f"{parsed.scheme}://{netloc}"
+            return clean_url, parsed.username, parsed.password
+        return proxy_url, None, None
+
+    async def _start_proxy_forwarder(self, proxy_url: str, port: int) -> None:
+        """Start a local proxy forwarder for transparent auth.
+
+        Chrome connects to 127.0.0.1:{port} (no auth), the forwarder
+        handles upstream proxy auth via Proxy-Authorization header.
+        """
+        from scraper.proxy_forwarder import ProxyForwarder
+        if self._proxy_forwarder:
+            await self._proxy_forwarder.stop()
+        self._proxy_forwarder = ProxyForwarder(proxy_url, port)
+        await self._proxy_forwarder.start()
 
     async def start(self) -> None:
         """Launch Chrome off-screen and warm up Cloudflare trust.
@@ -239,13 +299,30 @@ class HLTVClient:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
+            # Prevent Chrome from throttling background/occluded windows
+            # (needed for Turnstile clicks and JS rendering when not focused)
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
             # Enable software GL so canvas fingerprint isn't empty/wrong
             "--use-gl=swiftshader",
             "--enable-gpu-rasterization",
             "--ignore-gpu-blocklist",
         ]
         if self._proxy_url:
-            browser_args.append(f"--proxy-server={self._proxy_url}")
+            if self._proxy_user:
+                # Use local forwarder for transparent proxy auth.
+                # Chrome connects to 127.0.0.1 (no auth), forwarder
+                # handles upstream auth — avoids CDP Fetch and extension issues.
+                original_proxy = (
+                    f"{urlparse(self._proxy_url).scheme}://"
+                    f"{self._proxy_user}:{self._proxy_pass}@"
+                    f"{urlparse(self._proxy_url).hostname}:{urlparse(self._proxy_url).port}"
+                )
+                await self._start_proxy_forwarder(original_proxy, self._forwarder_port)
+                browser_args.append(f"--proxy-server=http://127.0.0.1:{self._forwarder_port}")
+            else:
+                browser_args.append(f"--proxy-server={self._proxy_url}")
         self._browser = await nodriver.start(
             headless=False,
             browser_args=browser_args,
@@ -266,41 +343,47 @@ class HLTVClient:
             title = await self._safe_evaluate(first_tab, "document.title")
             if not isinstance(title, str):
                 title = ""
-            # Detect Chrome network error pages (ERR_NO_SUPPORTED_PROXIES, etc.)
-            html_snippet = await self._safe_evaluate(
-                first_tab, "document.documentElement.outerHTML.slice(0, 4000)"
+            body_text = await self._safe_evaluate(
+                first_tab, "document.body ? document.body.innerText : ''"
             )
-            if not isinstance(html_snippet, str):
-                html_snippet = ""
+            if not isinstance(body_text, str):
+                body_text = ""
+            is_chrome_error = await self._safe_evaluate(
+                first_tab,
+                "document.getElementById('main-frame-error') !== null"
+            )
             if (
-                'id="main-frame-error"' in html_snippet
-                or "ERR_NO_SUPPORTED_PROXIES" in html_snippet
+                is_chrome_error is True
+                or "This site can't be reached" in body_text
+                or "ERR_" in body_text
                 or "Access denied" in title
-                or "error code: 1005" in html_snippet
-                or "error code: 1006" in html_snippet
-                or "error code: 1007" in html_snippet
+                or "error code: 1005" in body_text
+                or "error code: 1006" in body_text
+                or "error code: 1007" in body_text
             ):
                 import re as _re
-                codes = _re.findall(r"ERR_[A-Z_]+", html_snippet)
+                codes = _re.findall(r"ERR_[A-Z_]+", body_text)
                 code = codes[0] if codes else "ERR_UNKNOWN"
                 raise HLTVFetchError(
-                    f"Proxy IP blocked or network error during warmup ({code}). "
-                    "Datacenter proxy IPs are blocked by HLTV (CF-1005). Use residential proxies.",
+                    f"Proxy/network error during warmup ({code}): {body_text[:200]}",
                     url=warmup_url,
                 )
             if not any(sig in title for sig in _CHALLENGE_TITLES):
+                if not title or "hltv" not in title.lower():
+                    logger.debug(
+                        "Warmup page has no HLTV title (%r) after %.1fs — waiting...",
+                        title, elapsed + self._config.page_load_wait,
+                    )
+                    await asyncio.sleep(_POLL_INTERVAL)
+                    elapsed += _POLL_INTERVAL
+                    continue
                 logger.info(
-                    "Cloudflare cleared after %.1fs",
-                    elapsed + self._config.page_load_wait,
+                    "Cloudflare cleared after %.1fs (title: %r)",
+                    elapsed + self._config.page_load_wait, title,
                 )
-                # Let CF cookies settle before real fetches begin
+                await self._dismiss_consent(first_tab)
                 await asyncio.sleep(0.5)
                 break
-            # Click the Turnstile "Verify you are human" checkbox via CDP mouse
-            # events. The widget is inside a cross-origin iframe so JS can't
-            # reach it, but physical input events dispatched at the correct
-            # screen coordinates cross iframe boundaries natively.
-            # Coordinates (216, 337) are the checkbox position in a 1280x900 window.
             try:
                 from nodriver.cdp.input_ import dispatch_mouse_event, MouseButton
                 await first_tab.send(dispatch_mouse_event(
@@ -312,7 +395,7 @@ class HLTVClient:
                     "mouseReleased", x=216, y=337,
                     button=MouseButton.LEFT, click_count=1,
                 ))
-                logger.debug("Clicked Turnstile checkbox at (216,337), waiting for verification...")
+                logger.debug("Clicked Turnstile checkbox at (216,337)")
                 _click_failures = 0
                 await asyncio.sleep(3.0)
             except Exception as click_exc:
@@ -345,8 +428,8 @@ class HLTVClient:
         self._tab_pool.put_nowait(first_tab)
         self._tab_rate_limiters[id(first_tab)] = RateLimiter(self._config)
 
-        # Additional tabs share the browser's cookie jar (CF clearance).
-        # Minimal sleep — tabs inherit CF cookies, no challenge to clear.
+        # Additional tabs share the browser's cookie jar (CF clearance)
+        # and proxy auth session — no need for Fetch domain setup.
         for i in range(1, num_tabs):
             tab = await self._browser.get(warmup_url)
             await asyncio.sleep(0.2)
@@ -356,6 +439,34 @@ class HLTVClient:
 
         if num_tabs > 1:
             logger.info("Browser ready with %d tabs (per-tab rate limiters)", num_tabs)
+
+    async def _dismiss_consent(self, tab) -> bool:
+        """Click Cookiebot 'Allow All' if the consent dialog is visible.
+
+        Returns True if consent was dismissed, False if not present.
+        """
+        try:
+            clicked = await asyncio.wait_for(
+                tab.evaluate(
+                    "(() => {"
+                    "  const btn = document.getElementById("
+                    "    'CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll'"
+                    "  );"
+                    "  if (btn && btn.offsetParent !== null) {"
+                    "    btn.click(); return true;"
+                    "  }"
+                    "  return false;"
+                    "})()"
+                ),
+                timeout=3.0,
+            )
+            if clicked is True:
+                logger.info("Dismissed Cookiebot consent dialog")
+                await asyncio.sleep(1.0)  # let overlay disappear
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _safe_evaluate(self, tab, js: str, timeout: float | None = None):
         """Wrap tab.evaluate() with asyncio.wait_for to prevent indefinite hangs.
@@ -379,6 +490,7 @@ class HLTVClient:
         content_marker: str | None = None,
         ready_selector: str | None = None,
         page_type: str | None = None,
+        stable_selector: bool = False,
     ) -> str:
         """Navigate a specific tab to a URL and return the page HTML.
 
@@ -404,10 +516,27 @@ class HLTVClient:
         _t0 = time.monotonic()
 
         try:
-            # Navigate with minimal post-nav sleep — ready_selector polling
-            # is the real gate for page readiness, not a fixed sleep.
+            # Capture pre-navigation content fingerprint for stale DOM
+            # detection.  After navigation, if readyState never dropped to
+            # 'loading', we verify content changed — identical content
+            # means the old DOM is still showing.
+            _pre_nav_fp = None
+            try:
+                _pre_nav_fp = await self._safe_evaluate(
+                    tab,
+                    "document.body ? document.body.innerText.slice(200, 600) : ''",
+                    timeout=2.0,
+                )
+                if not isinstance(_pre_nav_fp, str) or len(_pre_nav_fp) < 30:
+                    _pre_nav_fp = None
+            except Exception:
+                pass
+
+            # Navigate with a short post-nav sleep to let the browser begin
+            # tearing down the old DOM.  0.5s balances speed with reliability
+            # (0.1s was too fast — DOM was still from the previous page).
             _orig_sleep = tab.sleep
-            tab.sleep = lambda t=0.1: _orig_sleep(0.1)
+            tab.sleep = lambda t=0.5: _orig_sleep(0.5)
             try:
                 # Nav lock serialises CDP Page.navigate across tabs (multi-tab only)
                 nav_coro = asyncio.wait_for(
@@ -420,6 +549,10 @@ class HLTVClient:
                 else:
                     await nav_coro
             except asyncio.TimeoutError:
+                # Nav timeout on a DC IP usually means Cloudflare is
+                # throttling — back off so subsequent requests slow down.
+                tab_rl.backoff()
+                self.rate_limiter.backoff()
                 raise HLTVFetchError(
                     f"Navigation timed out after {self._config.navigation_timeout}s for {url}",
                     url=url,
@@ -471,12 +604,109 @@ class HLTVClient:
                         url=url,
                     )
 
+            # Wait for the new page DOM to replace the old one.
+            #
+            # Problem: after tab.get(url), the URL updates immediately but
+            # the old DOM can persist briefly.  readyState stays 'complete'
+            # from the old page, so checking URL+readyState=='complete' can
+            # pass before the new page actually loads.
+            #
+            # Solution: first wait for readyState to drop to 'loading' or
+            # 'interactive' (proving the old DOM was torn down), then wait
+            # for 'complete' (new page fully loaded).
+            expected_path = urlparse(url).path
+            saw_loading = False
+            _phase1_deadline = time.monotonic() + 3.0  # 3s wall-clock max
+            while time.monotonic() < _phase1_deadline:
+                try:
+                    result = await self._safe_evaluate(
+                        tab,
+                        "document.location.pathname + '|' + document.readyState",
+                        timeout=2.0,
+                    )
+                    if isinstance(result, str) and "|" in result:
+                        path, state = result.rsplit("|", 1)
+                        if state in ("loading", "interactive"):
+                            saw_loading = True
+                            break
+                except Exception:
+                    # CDP busy — likely mid-navigation, which is what we want
+                    saw_loading = True
+                    break
+                await asyncio.sleep(0.1)
+
+            # Now wait for readyState to reach 'complete' (new page loaded)
+            settled = False
+            _phase2_deadline = time.monotonic() + 8.0  # 8s wall-clock max
+            while time.monotonic() < _phase2_deadline:
+                try:
+                    result = await self._safe_evaluate(
+                        tab,
+                        "document.location.pathname + '|' + document.readyState",
+                        timeout=3.0,
+                    )
+                    if isinstance(result, str) and "|" in result:
+                        path, state = result.rsplit("|", 1)
+                        if path == expected_path and state == "complete":
+                            settled = True
+                            break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+            if not settled:
+                logger.debug("Page load not confirmed for %s (saw_loading=%s)", url, saw_loading)
+
+            # When readyState never dropped to 'loading', the old DOM may
+            # still be showing.  Verify via content fingerprint — if the
+            # page text hasn't changed, wait up to 3s for the real load.
+            if _pre_nav_fp and not saw_loading:
+                _fp_deadline = time.monotonic() + 3.0  # 3s wall-clock max
+                _fp_matched = False
+                while time.monotonic() < _fp_deadline:
+                    try:
+                        _post_fp = await self._safe_evaluate(
+                            tab,
+                            "document.body ? document.body.innerText.slice(200, 600) : ''",
+                            timeout=2.0,
+                        )
+                        if isinstance(_post_fp, str) and _post_fp != _pre_nav_fp:
+                            _fp_matched = True
+                            break
+                    except Exception:
+                        _fp_matched = True  # CDP error — likely mid-navigation
+                        break
+                    await asyncio.sleep(0.2)
+                if not _fp_matched:
+                    # Content identical after 3s — definitely stale DOM
+                    raise HLTVFetchError(
+                        f"Stale DOM: content unchanged after navigation to {url}",
+                        url=url,
+                    )
+
             # Wait for ready_selector in the live DOM before extracting HTML
             _t_sel = time.monotonic()
             if ready_selector:
-                await self._wait_for_selector(tab, url, ready_selector)
+                await self._wait_for_selector(tab, url, ready_selector, stable=stable_selector, page_type=page_type)
                 # Minimal settle — selector match means DOM is ready
                 await asyncio.sleep(0.02)
+
+            # For map_stats pages, also wait for round-history images to render.
+            # These load after the stats table and were being missed with only
+            # a 20ms settle.  Use stable=True so the image count must stabilize
+            # (same on two consecutive polls), ensuring all rounds are loaded.
+            # Non-fatal: forfeits may not have round history.
+            if page_type == "map_stats":
+                try:
+                    await self._wait_for_selector(
+                        tab, url,
+                        ".round-history-con img.round-history-outcome",
+                        timeout=6.0,
+                        stable=True,
+                        dump_on_fail=False,
+                    )
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    logger.debug("No round-history found for %s (forfeit?)", url)
             _t_sel_done = time.monotonic()
 
             # Extract HTML — targeted for known page types, full page otherwise.
@@ -497,16 +727,19 @@ class HLTVClient:
             if len(html) < _min_size and extractor_js:
                 # Targeted extraction returned too little — retry once
                 logger.debug("Short extraction: %d chars for %s", len(html), url)
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.5)
                 html = await self._safe_evaluate(tab, extractor_js)
                 if not isinstance(html, str):
                     html = ""
                 if len(html) < _min_size:
-                    logger.info("Targeted extraction failed for %s — full page fallback (%d chars)", url, len(html))
-                    html = await self._safe_evaluate(tab, "document.documentElement.outerHTML")
-                    if not isinstance(html, str):
-                        html = ""
-                    _min_size = 10000
+                    # Extractor still empty despite ready_selector match.
+                    # Page state likely changed (CF re-challenge or DOM mutation).
+                    # Raise error so tenacity retries the full navigation.
+                    raise HLTVFetchError(
+                        f"Targeted extraction empty for {url} ({len(html)} chars) "
+                        f"— page state changed after selector matched",
+                        url=url,
+                    )
             elif len(html) < _min_size:
                 await asyncio.sleep(self._config.page_load_wait)
                 html = await self._safe_evaluate(tab, "document.documentElement.outerHTML")
@@ -573,6 +806,8 @@ class HLTVClient:
 
         except CloudflareChallenge:
             raise
+        except HLTVFetchError:
+            raise
         except ValueError:
             # Raised by _wait_for_selector when page is loaded but element
             # genuinely missing (no data).  Don't wrap in HLTVFetchError —
@@ -599,42 +834,151 @@ class HLTVClient:
 
     async def _wait_for_selector(
         self, tab, url: str, selector: str, timeout: float = 5.0,
+        stable: bool = False, dump_on_fail: bool = True,
+        page_type: str | None = None,
     ) -> None:
         """Poll the live DOM until a CSS selector matches an element.
 
+        When *stable* is True, waits for the element count to stabilise
+        (same count on two consecutive polls) instead of returning on
+        the first match.  Use this for listing pages where the DOM is
+        populated incrementally (e.g. 100 result entries).
+
         Raises HLTVFetchError if the selector is not found within *timeout*.
         """
-        js = f"!!document.querySelector({selector!r})"
-        elapsed = 0.0
+        # Stable mode needs more time: DOM count must match on two consecutive
+        # polls, which requires all ~100 elements to finish rendering.
+        # Docker/Xvfb environments render slower than native displays.
+        if stable and timeout <= 5.0:
+            timeout = 15.0
+        count_js = f"document.querySelectorAll({selector!r}).length"
+        # Use wall-clock deadline instead of accumulated sleep intervals,
+        # because _safe_evaluate can take seconds when Chrome is slow.
+        _sel_deadline = time.monotonic() + timeout
         # Start polling very fast — SSR pages usually have content by 30-80ms.
         # Back off after a few misses to avoid hammering CDP.
         interval = 0.03
         polls = 0
-        while elapsed < timeout:
-            found = await self._safe_evaluate(tab, js)
-            if found is True:
-                return
+        prev_count = 0
+        elapsed = 0.0  # kept for logging
+        while time.monotonic() < _sel_deadline:
+            count = await self._safe_evaluate(tab, count_js)
+            if not isinstance(count, (int, float)):
+                count = 0
+            else:
+                count = int(count)
+            if count > 0:
+                if not stable:
+                    return
+                # Stable mode: count must match previous poll
+                if count == prev_count:
+                    return
+                prev_count = count
+                # Once elements start appearing, poll at steady interval
+                interval = 0.15
             await asyncio.sleep(interval)
-            elapsed += interval
+            elapsed = timeout - (_sel_deadline - time.monotonic())
             polls += 1
             if polls >= 3:  # after ~90ms, slow to 0.15s
                 interval = 0.15
             if polls >= 6:  # after ~540ms, slow to 0.4s
                 interval = 0.4
-        # Selector not found — check if page actually finished loading.
-        # If document.readyState is 'complete', the page is loaded but the
-        # expected element simply isn't there (no data).  Raise ValueError
-        # so tenacity does NOT retry and the pipeline logs it as a warning.
-        # If the page is still loading, raise HLTVFetchError to trigger retry.
+        # Selector not found — try dismissing consent overlay first.
+        # If consent was blocking, raise HLTVFetchError so tenacity retries
+        # the full navigation — the consent cookie is now set so the next
+        # load will show actual content instead of the consent overlay.
+        if await self._dismiss_consent(tab):
+            raise HLTVFetchError(
+                f"Consent overlay dismissed on {url} — retrying navigation",
+                url=url,
+            )
+
+        # Selector not found — dump page HTML for debugging
+        if dump_on_fail:
+            try:
+                debug_html = await self._safe_evaluate(
+                    tab, "document.documentElement.outerHTML"
+                )
+                if isinstance(debug_html, str):
+                    from pathlib import Path
+                    dump_path = Path("data") / "debug_selector_fail.html"
+                    dump_path.parent.mkdir(parents=True, exist_ok=True)
+                    dump_path.write_text(debug_html, encoding="utf-8")
+                    # Also get body text and title for the log
+                    body_text = await self._safe_evaluate(
+                        tab, "document.body ? document.body.innerText.slice(0, 500) : '(no body)'"
+                    )
+                    page_title = await self._safe_evaluate(tab, "document.title")
+                    logger.warning(
+                        "Selector %r not found after %.1fs (%d polls, last count=%d). "
+                        "HTML dumped to %s (%d bytes). Title: %r. Body text: %s",
+                        selector, elapsed, polls, prev_count, dump_path,
+                        len(debug_html), page_title,
+                        body_text if isinstance(body_text, str) else "(unavailable)",
+                    )
+            except Exception:
+                pass
+
+        # Check if page actually finished loading.
         try:
             ready = await self._safe_evaluate(tab, "document.readyState === 'complete'")
         except Exception:
             ready = False
+
         if ready is True:
-            raise ValueError(
-                f"Selector {selector!r} not found on loaded page {url} "
-                f"— data not available"
+            # Page is loaded — but is it actually HLTV content?
+            # A Cloudflare interstitial or error page can also have readyState 'complete'.
+            # Only raise ValueError (non-retryable) if we're confident this is real HLTV content.
+            try:
+                is_hltv = await self._safe_evaluate(
+                    tab,
+                    "document.querySelector('.results') !== null "
+                    "|| document.querySelector('.contentCol') !== null "
+                    "|| document.querySelector('.navbar') !== null",
+                )
+            except Exception:
+                is_hltv = False
+
+            if is_hltv is True:
+                # Stale DOM detection: check if DOM has elements from a
+                # DIFFERENT page type (e.g. economy elements on a stats
+                # page).  If so, the old DOM hasn't been torn down yet —
+                # raise HLTVFetchError (retryable) instead of ValueError.
+                if page_type:
+                    _WRONG_PAGE = {
+                        "map_stats": "[data-fusionchart-config]",
+                        "map_performance": "[data-fusionchart-config]",
+                        "map_economy": ".player-nick",
+                        "overview": "[data-fusionchart-config]",
+                    }
+                    wrong_sel = _WRONG_PAGE.get(page_type)
+                    if wrong_sel:
+                        try:
+                            wrong_count = await self._safe_evaluate(
+                                tab,
+                                f"document.querySelectorAll({wrong_sel!r}).length",
+                            )
+                            if isinstance(wrong_count, (int, float)) and int(wrong_count) > 0:
+                                raise HLTVFetchError(
+                                    f"Stale DOM on {url}: found {wrong_sel} from "
+                                    f"previous page (expected {selector})",
+                                    url=url,
+                                )
+                        except HLTVFetchError:
+                            raise
+                        except Exception:
+                            pass
+                raise ValueError(
+                    f"Selector {selector!r} not found on loaded page {url} "
+                    f"— data not available"
+                )
+            # Page loaded but doesn't look like HLTV — likely CF interstitial.
+            # Raise HLTVFetchError to allow tenacity retry.
+            logger.warning(
+                "Page loaded but no HLTV markers found — likely Cloudflare interstitial. "
+                "Retrying via HLTVFetchError."
             )
+
         raise HLTVFetchError(
             f"Ready selector {selector!r} not found on {url} "
             f"after {timeout:.0f}s",
@@ -643,8 +987,8 @@ class HLTVClient:
 
     @retry(
         retry=retry_if_exception_type((CloudflareChallenge, HLTVFetchError)),
-        wait=wait_exponential_jitter(initial=1, max=15, jitter=1),
-        stop=stop_after_attempt(5),  # overridden in _patch_retry
+        wait=wait_exponential_jitter(initial=2, max=20, jitter=2),
+        stop=stop_after_attempt(4),  # overridden in _patch_retry
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
@@ -653,6 +997,7 @@ class HLTVClient:
         content_marker: str | None = None,
         ready_selector: str | None = None,
         page_type: str | None = None,
+        stable_selector: bool = False,
     ) -> str:
         """Fetch a URL using a tab from the pool.
 
@@ -670,6 +1015,9 @@ class HLTVClient:
             page_type: If set and a JS extractor exists for this type,
                 extracts only the relevant DOM elements (~50–100 KB) instead
                 of the full 5–12 MB page.  Drastically reduces CDP transfer.
+            stable_selector: If True, wait for the ready_selector element
+                count to stabilise (same on two consecutive polls) before
+                extracting HTML.  Use for listing pages.
 
         Returns:
             The page HTML as a string.
@@ -688,6 +1036,7 @@ class HLTVClient:
                 content_marker=content_marker,
                 ready_selector=ready_selector,
                 page_type=page_type,
+                stable_selector=stable_selector,
             )
         finally:
             self._tab_pool.put_nowait(tab)
@@ -718,8 +1067,8 @@ class HLTVClient:
 
     @retry(
         retry=retry_if_exception_type((CloudflareChallenge, HLTVFetchError)),
-        wait=wait_exponential_jitter(initial=1, max=15, jitter=1),
-        stop=stop_after_attempt(5),
+        wait=wait_exponential_jitter(initial=2, max=20, jitter=2),
+        stop=stop_after_attempt(4),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
@@ -728,6 +1077,7 @@ class HLTVClient:
         content_marker: str | None = None,
         ready_selector: str | None = None,
         page_type: str | None = None,
+        stable_selector: bool = False,
     ) -> str:
         """Fetch a URL using a *specific* (already-acquired) tab.
 
@@ -743,12 +1093,14 @@ class HLTVClient:
             content_marker=content_marker,
             ready_selector=ready_selector,
             page_type=page_type,
+            stable_selector=stable_selector,
         )
 
     async def fetch_many(
         self, urls: list[str],
         content_marker: str | None = None,
         ready_selector: str | None = None,
+        page_type: str | None = None,
     ) -> list[str | Exception]:
         """Fetch multiple URLs concurrently using the tab pool.
 
@@ -761,6 +1113,7 @@ class HLTVClient:
             content_marker: Optional string that must appear in each page's HTML.
             ready_selector: Optional CSS selector that must exist in the
                 live DOM before each page is considered loaded.
+            page_type: Optional page type for targeted extraction/wait logic.
 
         Returns:
             List of results in the same order as urls. Each element is
@@ -768,7 +1121,7 @@ class HLTVClient:
         """
         async def _safe_fetch(url: str) -> str | Exception:
             try:
-                return await self.fetch(url, content_marker=content_marker, ready_selector=ready_selector)
+                return await self.fetch(url, content_marker=content_marker, ready_selector=ready_selector, page_type=page_type)
             except Exception as exc:
                 return exc
 
@@ -789,6 +1142,14 @@ class HLTVClient:
         self._browser = None
         self._tabs.clear()
         self._tab_pool = None
+
+        # Stop proxy forwarder
+        if self._proxy_forwarder:
+            try:
+                await self._proxy_forwarder.stop()
+            except Exception:
+                pass
+            self._proxy_forwarder = None
 
         # nodriver util.free(): stops browser + deletes /tmp/uc_* profile dir
         try:
@@ -855,15 +1216,19 @@ class HLTVClient:
         }
 
     def _patch_retry(self) -> None:
-        """Patch tenacity stop condition to use config.max_retries."""
+        """Patch tenacity stop/wait to use config.max_retries."""
         self.fetch.retry.stop = stop_after_attempt(self._config.max_retries)
         self.fetch_with_tab.retry.stop = stop_after_attempt(self._config.max_retries)
+        _wait = wait_exponential_jitter(initial=2, max=20, jitter=2)
+        self.fetch.retry.wait = _wait
+        self.fetch_with_tab.retry.wait = _wait
 
 
 async def fetch_distributed(
     clients: list[HLTVClient], urls: list[str],
     content_marker: str | None = None,
     ready_selector: str | None = None,
+    page_type: str | None = None,
 ) -> list[str | Exception]:
     """Split URLs round-robin across clients, fetch in parallel, reassemble in order.
 
@@ -877,6 +1242,7 @@ async def fetch_distributed(
         content_marker: Optional string that must appear in each page's HTML.
         ready_selector: Optional CSS selector that must exist in the live DOM
             before each page is considered loaded.
+        page_type: Optional page type for targeted extraction/wait logic.
 
     Returns:
         List of results in the same order as *urls*. Each element is
@@ -885,7 +1251,7 @@ async def fetch_distributed(
     if not clients:
         raise ValueError("fetch_distributed requires at least one client")
     if len(clients) == 1:
-        return await clients[0].fetch_many(urls, content_marker=content_marker, ready_selector=ready_selector)
+        return await clients[0].fetch_many(urls, content_marker=content_marker, ready_selector=ready_selector, page_type=page_type)
 
     n = len(clients)
     buckets: list[list[tuple[int, str]]] = [[] for _ in range(n)]
@@ -896,7 +1262,8 @@ async def fetch_distributed(
         client: HLTVClient, indexed_urls: list[tuple[int, str]]
     ) -> list[tuple[int, str | Exception]]:
         results = await client.fetch_many(
-            [u for _, u in indexed_urls], content_marker=content_marker, ready_selector=ready_selector,
+            [u for _, u in indexed_urls], content_marker=content_marker,
+            ready_selector=ready_selector, page_type=page_type,
         )
         return [(idx, res) for (idx, _), res in zip(indexed_urls, results)]
 
