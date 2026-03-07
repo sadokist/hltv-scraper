@@ -137,6 +137,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip saving raw HTML to disk (faster, less disk usage; DB data is still written)",
     )
     parser.add_argument(
+        "--nav-timeout",
+        type=float,
+        default=None,
+        help="CDP navigation timeout in seconds (default: 25)",
+    )
+    parser.add_argument(
         "--per-match-timeout",
         type=float,
         default=None,
@@ -216,6 +222,8 @@ async def async_main(args: argparse.Namespace) -> None:
         config_overrides["min_delay"] = args.min_delay
     if args.no_save_html:
         config_overrides["save_html"] = False
+    if args.nav_timeout is not None:
+        config_overrides["navigation_timeout"] = args.nav_timeout
     if args.per_match_timeout is not None:
         config_overrides["per_match_timeout"] = args.per_match_timeout
     config = ScraperConfig(**config_overrides)

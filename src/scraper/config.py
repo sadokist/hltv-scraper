@@ -45,13 +45,13 @@ class ScraperConfig:
     concurrent_tabs: int = 2
 
     # CDP navigation timeout (asyncio.wait_for around tab.get())
-    navigation_timeout: float = 15.0
+    navigation_timeout: float = 25.0
 
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
     evaluate_timeout: float = 8.0
 
-    # Hard ceiling per match — defense-in-depth (2 minutes)
-    per_match_timeout: float = 180.0
+    # Hard ceiling per match — defense-in-depth (4 minutes)
+    per_match_timeout: float = 240.0
 
     # Seconds to poll for Cloudflare challenge to clear during fetches
     challenge_wait: float = 30.0
