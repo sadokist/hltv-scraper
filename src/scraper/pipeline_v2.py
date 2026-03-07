@@ -543,9 +543,9 @@ async def run_pipeline_v2(
         client_queue.put_nowait(c)
 
     counters = {"done": 0, "failed": 0}
-    # Per-client consecutive timeout tracker for circuit-breaker restarts
-    client_timeouts: dict[int, int] = {id(c): 0 for c in clients}
-    _TIMEOUT_RESTART_THRESHOLD = 2
+    # Per-client consecutive failure tracker (timeouts + match failures)
+    client_failures: dict[int, int] = {id(c): 0 for c in clients}
+    _FAILURE_RESTART_THRESHOLD = 3  # rotate proxy after 3 consecutive failures
     # Per-client match counter for proactive proxy rotation
     client_match_count: dict[int, int] = {id(c): 0 for c in clients}
     _PROXY_ROTATE_EVERY = 50  # rotate less often — restarts waste ~10s
@@ -562,7 +562,7 @@ async def run_pipeline_v2(
             if not client.is_healthy:
                 try:
                     await client.restart()
-                    client_timeouts[id(client)] = 0
+                    client_failures[id(client)] = 0
                 except Exception as restart_exc:
                     logger.error("Browser restart failed for match %d: %s",
                                  entry["match_id"], restart_exc)
@@ -587,25 +587,24 @@ async def run_pipeline_v2(
                 discovery_repo.update_status(entry["match_id"], "failed")
                 counters["failed"] += 1
                 results["overview"]["failed"] += 1
-                # Circuit breaker: restart browser after consecutive timeouts
-                client_timeouts[id(client)] = client_timeouts.get(id(client), 0) + 1
-                if client_timeouts[id(client)] >= _TIMEOUT_RESTART_THRESHOLD:
+                # Circuit breaker: restart browser after consecutive failures
+                client_failures[id(client)] = client_failures.get(id(client), 0) + 1
+                if client_failures[id(client)] >= _FAILURE_RESTART_THRESHOLD:
                     logger.warning(
-                        "Client %d hit %d consecutive timeouts — restarting browser",
-                        id(client), client_timeouts[id(client)],
+                        "Client hit %d consecutive failures — rotating proxy",
+                        client_failures[id(client)],
                     )
                     try:
                         await client.restart()
-                        client_timeouts[id(client)] = 0
+                        client_failures[id(client)] = 0
                     except Exception:
                         logger.error("Circuit-breaker restart failed")
                 return
 
-            # Success — reset timeout counter for this client
-            client_timeouts[id(client)] = 0
             client_match_count[id(client)] = client_match_count.get(id(client), 0) + 1
 
             if r["ok"]:
+                client_failures[id(client)] = 0
                 discovery_repo.update_status(entry["match_id"], "scraped")
                 counters["done"] += 1
                 results["overview"]["parsed"]     += 1
@@ -620,7 +619,7 @@ async def run_pipeline_v2(
                         and hasattr(client, '_proxy_urls') and client._proxy_urls):
                     try:
                         await client.restart()
-                        client_timeouts[id(client)] = 0
+                        client_failures[id(client)] = 0
                     except Exception:
                         logger.error("Proactive proxy rotation restart failed")
             else:
@@ -630,6 +629,18 @@ async def run_pipeline_v2(
                 logger.warning("[%d/%d] Match %d failed: %s",
                                counters["done"] + counters["failed"], total,
                                entry["match_id"], r["error"])
+                # Circuit breaker: rotate proxy after consecutive match failures
+                client_failures[id(client)] = client_failures.get(id(client), 0) + 1
+                if client_failures[id(client)] >= _FAILURE_RESTART_THRESHOLD:
+                    logger.warning(
+                        "Client hit %d consecutive failures — rotating proxy",
+                        client_failures[id(client)],
+                    )
+                    try:
+                        await client.restart()
+                        client_failures[id(client)] = 0
+                    except Exception:
+                        logger.error("Circuit-breaker restart failed")
         except Exception as exc:
             counters["failed"] += 1
             results["overview"]["failed"] += 1
@@ -638,7 +649,7 @@ async def run_pipeline_v2(
             if not client.is_healthy:
                 try:
                     await client.restart()
-                    client_timeouts[id(client)] = 0
+                    client_failures[id(client)] = 0
                 except Exception:
                     logger.error("Post-crash browser restart also failed")
         finally:
