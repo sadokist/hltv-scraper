@@ -245,6 +245,9 @@ class HLTVClient:
         await self.close()
         self._nav_lock = None  # set in start() based on tab count
         self._last_eval_ok = time.monotonic()  # reset staleness timer
+        # Reset rate limiters — the old proxy was throttled, new one is fresh
+        self.rate_limiter = RateLimiter(self._config)
+        self._tab_rate_limiters.clear()
         await self.start()
         logger.info("Browser restarted successfully")
 
