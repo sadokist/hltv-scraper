@@ -551,6 +551,10 @@ async def run_pipeline_v2(
     _PROXY_ROTATE_EVERY = 50  # rotate less often — restarts waste ~10s
     t0 = time.monotonic()
 
+    def _fail_status(entry: dict) -> str:
+        """'retry' matches stay 'retry' on failure; others go to 'failed'."""
+        return "retry" if entry.get("status") == "retry" else "failed"
+
     async def process_one(entry: dict) -> None:
         # Acquire client FIRST to prevent queue leaks on early-return paths.
         client = await client_queue.get()
@@ -584,7 +588,7 @@ async def run_pipeline_v2(
             except asyncio.TimeoutError:
                 logger.error("Match %d timed out after %.0fs",
                              entry["match_id"], config.per_match_timeout)
-                discovery_repo.update_status(entry["match_id"], "failed")
+                discovery_repo.update_status(entry["match_id"], _fail_status(entry))
                 counters["failed"] += 1
                 results["overview"]["failed"] += 1
                 # Circuit breaker: restart browser after consecutive failures
@@ -623,7 +627,7 @@ async def run_pipeline_v2(
                     except Exception:
                         logger.error("Proactive proxy rotation restart failed")
             else:
-                discovery_repo.update_status(entry["match_id"], "failed")
+                discovery_repo.update_status(entry["match_id"], _fail_status(entry))
                 counters["failed"] += 1
                 results["overview"]["failed"] += 1
                 logger.warning("[%d/%d] Match %d failed: %s",

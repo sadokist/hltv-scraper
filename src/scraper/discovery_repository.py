@@ -131,7 +131,7 @@ class DiscoveryRepository:
 
     def count_pending(self) -> int:
         with self.conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM scrape_queue WHERE status = 'pending'")
+            cur.execute("SELECT COUNT(*) FROM scrape_queue WHERE status IN ('pending', 'retry')")
             return cur.fetchone()[0]
 
     def count_total(self) -> int:
@@ -152,7 +152,7 @@ class DiscoveryRepository:
     def get_pending_matches(self, limit: int = 10) -> list[dict]:
         with self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                "SELECT * FROM scrape_queue WHERE status = 'pending' "
+                "SELECT * FROM scrape_queue WHERE status IN ('pending', 'retry') "
                 "ORDER BY match_id LIMIT %s",
                 (limit,),
             )
