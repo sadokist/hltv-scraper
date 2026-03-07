@@ -487,6 +487,9 @@ class HLTVClient:
             self._last_eval_ok = time.monotonic()
             return result
         except asyncio.TimeoutError:
+            # Timeout means CDP didn't respond in time, but the browser
+            # process is likely still alive — update health timestamp.
+            self._last_eval_ok = time.monotonic()
             raise HLTVFetchError(
                 f"CDP evaluate timed out after {timeout}s", url=""
             )
@@ -555,8 +558,10 @@ class HLTVClient:
                 else:
                     await nav_coro
             except asyncio.TimeoutError:
-                # Nav timeout on a DC IP usually means Cloudflare is
-                # throttling — back off so subsequent requests slow down.
+                # Nav timeout — page didn't load but browser is alive.
+                # Update health timestamp so retry loop doesn't trigger
+                # false "unresponsive" restarts.
+                self._last_eval_ok = time.monotonic()
                 tab_rl.backoff()
                 self.rate_limiter.backoff()
                 raise HLTVFetchError(
