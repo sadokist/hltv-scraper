@@ -45,7 +45,10 @@ class ScraperConfig:
     concurrent_tabs: int = 2
 
     # CDP navigation timeout (asyncio.wait_for around tab.get())
-    navigation_timeout: float = 45.0
+    # Cloudflare challenge pages never fire the load event, so nav
+    # always times out on them.  Keep this short; the challenge solver
+    # in _fetch_with_tab handles the rest.
+    navigation_timeout: float = 15.0
 
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
     evaluate_timeout: float = 8.0

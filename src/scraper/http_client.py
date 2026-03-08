@@ -612,16 +612,62 @@ class HLTVClient:
                 else:
                     await nav_coro
             except asyncio.TimeoutError:
-                # Nav timeout — page didn't load but browser is alive.
-                # Update health timestamp so retry loop doesn't trigger
-                # false "unresponsive" restarts.
+                # Nav timeout — page didn't fully load.  Before giving up,
+                # check whether we landed on a Cloudflare challenge page that
+                # just needs a Turnstile click.  The challenge page loads
+                # quickly but the load event never fires (no onload), so
+                # tab.get() always times out.
                 self._last_eval_ok = time.monotonic()
-                tab_rl.backoff()
-                self.rate_limiter.backoff()
-                raise HLTVFetchError(
-                    f"Navigation timed out after {self._config.navigation_timeout}s for {url}",
-                    url=url,
-                )
+                _timeout_title = await self._safe_evaluate(tab, "document.title")
+                if not isinstance(_timeout_title, str):
+                    _timeout_title = ""
+                if any(sig in _timeout_title for sig in _CHALLENGE_TITLES):
+                    logger.info(
+                        "Nav timeout was Cloudflare challenge on %s — solving...", url,
+                    )
+                    _cf_solved = False
+                    _cf_elapsed = 0.0
+                    while _cf_elapsed < self._config.challenge_wait:
+                        try:
+                            from nodriver.cdp.input_ import (
+                                dispatch_mouse_event,
+                                MouseButton,
+                            )
+                            await tab.send(dispatch_mouse_event(
+                                "mousePressed", x=216, y=337,
+                                button=MouseButton.LEFT, click_count=1,
+                            ))
+                            await asyncio.sleep(0.1)
+                            await tab.send(dispatch_mouse_event(
+                                "mouseReleased", x=216, y=337,
+                                button=MouseButton.LEFT, click_count=1,
+                            ))
+                        except Exception:
+                            pass
+                        await asyncio.sleep(_POLL_INTERVAL)
+                        _cf_elapsed += _POLL_INTERVAL
+                        _cf_title = await self._safe_evaluate(tab, "document.title")
+                        if not isinstance(_cf_title, str):
+                            _cf_title = ""
+                        if not any(sig in _cf_title for sig in _CHALLENGE_TITLES):
+                            logger.info("Challenge cleared after %.1fs", _cf_elapsed)
+                            _cf_solved = True
+                            break
+                    if not _cf_solved:
+                        tab_rl.backoff()
+                        self.rate_limiter.backoff()
+                        raise HLTVFetchError(
+                            f"Cloudflare challenge on {url} did not clear after {self._config.challenge_wait}s",
+                            url=url,
+                        )
+                    # Challenge cleared — fall through to normal DOM check
+                else:
+                    tab_rl.backoff()
+                    self.rate_limiter.backoff()
+                    raise HLTVFetchError(
+                        f"Navigation timed out after {self._config.navigation_timeout}s for {url}",
+                        url=url,
+                    )
             finally:
                 tab.sleep = _orig_sleep
             _t_nav = time.monotonic()
