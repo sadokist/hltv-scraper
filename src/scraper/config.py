@@ -45,16 +45,16 @@ class ScraperConfig:
     concurrent_tabs: int = 2
 
     # CDP navigation timeout (asyncio.wait_for around tab.get())
-    navigation_timeout: float = 25.0
+    navigation_timeout: float = 45.0
 
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
     evaluate_timeout: float = 8.0
 
-    # Hard ceiling per match — defense-in-depth (4 minutes)
-    per_match_timeout: float = 240.0
+    # Hard ceiling per match — defense-in-depth (6 minutes)
+    per_match_timeout: float = 360.0
 
     # Seconds to poll for Cloudflare challenge to clear during fetches
-    challenge_wait: float = 30.0
+    challenge_wait: float = 60.0
 
     # HLTV base URL (single-site scraper)
     base_url: str = HLTV_BASE_URL
