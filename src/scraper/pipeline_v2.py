@@ -422,36 +422,46 @@ async def _scrape_match(
         return_exceptions=True,
     )
 
-    # Check if ALL maps succeeded
+    # Collect successful maps — persist partial results instead of
+    # throwing away the entire match when one map fails.
+    maps_ok = [
+        (m, r) for m, r in zip(playable, bc_results)
+        if isinstance(r, dict)
+    ]
     maps_failed = [
         m.mapstatsid for m, r in zip(playable, bc_results)
         if not isinstance(r, dict)
     ]
 
     if maps_failed:
+        logger.warning("Match %d: %d/%d maps failed %s",
+                       match_id, len(maps_failed), len(playable), maps_failed)
+
+    if not maps_ok:
+        # Total failure — nothing to persist
         result["ok"] = False
         result["maps_done"] = 0
-        result["error"] = f"{len(maps_failed)}/{len(playable)} maps failed (mapstatsids: {maps_failed})"
-        logger.warning("Match %d incomplete: %d/%d maps failed %s",
-                       match_id, len(maps_failed), len(playable), maps_failed)
+        result["error"] = f"all {len(playable)} maps failed (mapstatsids: {maps_failed})"
         return result
 
-    # All maps succeeded — persist everything atomically
+    # Persist whatever succeeded (could be partial)
     all_stats = []
     all_rounds = []
     all_economy = []
     all_kill_matrix = []
-    for r in bc_results:
-        # perf_stats is the merged version (basic + perf fields) — use it
-        # instead of map_stats to avoid duplicate inserts
+    for _m, r in maps_ok:
         all_stats.extend(r["perf_stats"])
         all_rounds.extend(r["rounds"])
         all_economy.extend(r["economy"])
         all_kill_matrix.extend(r["kill_matrix"])
 
+    # Filter maps_data to only include maps that succeeded
+    ok_map_numbers = {m.map_number for m, _ in maps_ok}
+    persisted_maps = [md for md in maps_data if md["map_number"] in ok_map_numbers]
+
     match_repo.persist_complete_match(
         match_data=match_data,
-        maps_data=maps_data,
+        maps_data=persisted_maps,
         vetoes_data=vetoes_data,
         all_stats=all_stats,
         all_rounds=all_rounds,
@@ -459,10 +469,15 @@ async def _scrape_match(
         all_kill_matrix=all_kill_matrix,
     )
     result["ok"] = True
-    result["maps_done"] = len(playable)
-    logger.info("Persisted match %d: %d maps, %d stats, %d rounds, %d economy, %d kill_matrix",
-                match_id, len(playable), len(all_stats), len(all_rounds),
-                len(all_economy), len(all_kill_matrix))
+    result["maps_done"] = len(maps_ok)
+    if maps_failed:
+        logger.info("Persisted match %d (partial): %d/%d maps, %d stats, %d rounds, %d economy, %d kill_matrix",
+                    match_id, len(maps_ok), len(playable), len(all_stats), len(all_rounds),
+                    len(all_economy), len(all_kill_matrix))
+    else:
+        logger.info("Persisted match %d: %d maps, %d stats, %d rounds, %d economy, %d kill_matrix",
+                    match_id, len(playable), len(all_stats), len(all_rounds),
+                    len(all_economy), len(all_kill_matrix))
     return result
 
 

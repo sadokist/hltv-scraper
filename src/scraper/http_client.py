@@ -66,7 +66,7 @@ _CHALLENGE_TITLES = (
 
 # Warm-up: max seconds to wait for Cloudflare to clear on first visit
 _WARMUP_TIMEOUT = 90
-_POLL_INTERVAL = 2
+_POLL_INTERVAL = 1
 
 # Targeted DOM extractors per page type.
 # Instead of dumping the full 5–12 MB outerHTML, extract only the elements
@@ -811,7 +811,7 @@ class HLTVClient:
                     await self._wait_for_selector(
                         tab, url,
                         ".round-history-con img.round-history-outcome",
-                        timeout=6.0,
+                        timeout=3.0,
                         stable=True,
                         dump_on_fail=False,
                     )

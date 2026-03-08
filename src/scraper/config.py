@@ -32,7 +32,7 @@ class ScraperConfig:
     # Seconds to wait after navigation for page to load (fallback retries).
     # Ready-selector polling is the real gate; this is only used for
     # content-marker misses and short-extraction retries.
-    page_load_wait: float = 0.4
+    page_load_wait: float = 0.25
 
     # Save raw HTML to disk for debugging/resumability.
     # Set to False for large production runs to avoid 250k+ gzip files and
@@ -51,7 +51,7 @@ class ScraperConfig:
     navigation_timeout: float = 15.0
 
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
-    evaluate_timeout: float = 8.0
+    evaluate_timeout: float = 12.0
 
     # Hard ceiling per match — defense-in-depth (6 minutes)
     per_match_timeout: float = 360.0
