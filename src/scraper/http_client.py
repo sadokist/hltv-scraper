@@ -807,6 +807,21 @@ class HLTVClient:
             # (same on two consecutive polls), ensuring all rounds are loaded.
             # Non-fatal: forfeits may not have round history.
             if page_type == "map_stats":
+                # Capture the kills value right after .stats-table appears.
+                # The page initially renders series-aggregate kills here; a
+                # subsequent JS update replaces them with per-map kills.
+                # We record the initial value now so we can detect the update.
+                _kills_js = (
+                    "(function(){"
+                    "var t=document.querySelector"
+                    "('.stats-table.totalstats td.st-kills');"
+                    "return t?t.textContent.trim():'';"
+                    "})()"
+                )
+                _initial_kills = await self._safe_evaluate(tab, _kills_js)
+                if not isinstance(_initial_kills, str):
+                    _initial_kills = ""
+
                 try:
                     await self._wait_for_selector(
                         tab, url,
@@ -818,6 +833,23 @@ class HLTVClient:
                     await asyncio.sleep(0.05)
                 except Exception:
                     logger.debug("No round-history found for %s (forfeit?)", url)
+
+                # Wait for kills to change from the initial render and settle.
+                #
+                # Two bugs this fixes:
+                # 1. Series-aggregate capture: .totalstats initially shows
+                #    all-maps kills; JS replaces them with per-map kills after
+                #    the round-history loads. We wait for that replacement.
+                # 2. Stale-DOM after tab reuse: a tab that just finished map N
+                #    may still show map N's kills when navigated to map N+1.
+                #    The kills value changes once the new page fully renders.
+                #
+                # If the initial value was already correct (per-map stats
+                # loaded immediately), _wait_for_text_update times out
+                # silently and we proceed with the correct data.
+                await self._wait_for_text_update(
+                    tab, _kills_js, _initial_kills, timeout=5.0
+                )
             _t_sel_done = time.monotonic()
 
             # Extract HTML — targeted for known page types, full page otherwise.
@@ -942,6 +974,35 @@ class HLTVClient:
             _t_done - _t0, len(html),
         )
         return html
+
+    async def _wait_for_text_update(
+        self, tab, js_expr: str, initial: str, timeout: float = 5.0,
+    ) -> None:
+        """Poll a JS expression until it returns a value different from
+        *initial* AND that new value is stable (same on two consecutive polls).
+
+        Used to detect when a DOM cell has been updated from a known initial
+        render.  On HLTV map stats pages the .totalstats table first renders
+        with series-aggregate kills, then JS replaces them with per-map kills.
+        Capturing the initial value before the round-history wait and calling
+        this afterwards detects the update reliably.
+
+        Times out silently — the caller proceeds with whatever is in the DOM,
+        which may trigger a stale-DOM HLTVFetchError retry if still wrong.
+        """
+        deadline = time.monotonic() + timeout
+        prev = initial
+        interval = 0.15
+        while time.monotonic() < deadline:
+            val = await self._safe_evaluate(tab, js_expr)
+            if not isinstance(val, str):
+                val = ""
+            if val and val != initial:
+                # Value has changed from initial render — wait for it to settle
+                if val == prev:
+                    return  # stable at new value
+                prev = val
+            await asyncio.sleep(interval)
 
     async def _wait_for_selector(
         self, tab, url: str, selector: str, timeout: float = 5.0,

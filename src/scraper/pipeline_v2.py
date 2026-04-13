@@ -205,10 +205,14 @@ async def _scrape_match(
         try:
             if tab is not None:
                 map_html = await client.fetch_with_tab(
-                    tab, map_url, page_type="map_stats", ready_selector=".stats-table")
+                    tab, map_url, page_type="map_stats",
+                    ready_selector=".stats-table.totalstats",
+                    content_marker="match-info-box")
             else:
                 map_html = await client.fetch(
-                    map_url, page_type="map_stats", ready_selector=".stats-table")
+                    map_url, page_type="map_stats",
+                    ready_selector=".stats-table.totalstats",
+                    content_marker="match-info-box")
         except ValueError as exc:
             logger.warning("Map %d fetch: no data (%s)", mapstatsid, exc)
             return None

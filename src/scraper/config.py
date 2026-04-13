@@ -40,15 +40,21 @@ class ScraperConfig:
     save_html: bool = True
 
     # Number of browser tabs per instance.
-    # With 8 workers × 2 tabs = 16 concurrent fetches, which maximises
-    # throughput while keeping nav_lock contention low within each browser.
-    concurrent_tabs: int = 2
+    # Keep at 1: multiple tabs sharing a single Chrome WebSocket cause
+    # CDP response-routing confusion (responses for tab A can arrive on
+    # tab B's receive path, producing wrong page data silently).
+    # Parallelism comes from --workers (separate browser processes), not
+    # from multiple tabs within one browser.
+    concurrent_tabs: int = 1
 
     # CDP navigation timeout (asyncio.wait_for around tab.get())
     # Cloudflare challenge pages never fire the load event, so nav
     # always times out on them.  Keep this short; the challenge solver
     # in _fetch_with_tab handles the rest.
     navigation_timeout: float = 15.0
+
+    no_sandbox: bool = True
+    disable_dev_shm_usage: bool = True
 
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
     evaluate_timeout: float = 12.0
@@ -68,7 +74,8 @@ class ScraperConfig:
     # Discovery pagination
     game_type: str = "CS2"           # Game filter: CS2, CSGO, or CS16
     max_offset: int = 25000          # Last offset to paginate to (exclusive)
-    results_per_page: int = 100      # Entries per results page (HLTV constant)
+    results_per_page: int = 100 
+    min_stars: int = 2     # Entries per results page (HLTV constant)
 
     # Match overview batch size
     overview_batch_size: int = 10    # Matches to fetch per batch before parsing
@@ -81,6 +88,8 @@ class ScraperConfig:
 
     # Proxy configuration
     proxy_file: str | None = None      # Path to file with one proxy per line
+
+    headless: bool = True
 
     # Pipeline orchestration
     start_offset: int = 0              # Start offset for results pagination
