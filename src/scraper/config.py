@@ -1,5 +1,6 @@
 """Scraper configuration with sensible defaults for HLTV scraping."""
 
+import os
 from dataclasses import dataclass
 
 HLTV_BASE_URL = "https://www.hltv.org"
@@ -51,13 +52,13 @@ class ScraperConfig:
     # Cloudflare challenge pages never fire the load event, so nav
     # always times out on them.  Keep this short; the challenge solver
     # in _fetch_with_tab handles the rest.
-    navigation_timeout: float = 15.0
+    navigation_timeout: float = 25.0
 
     no_sandbox: bool = True
     disable_dev_shm_usage: bool = True
 
     # CDP evaluate timeout (asyncio.wait_for around tab.evaluate())
-    evaluate_timeout: float = 12.0
+    evaluate_timeout: float = float(os.getenv("EVALUATE_TIMEOUT", "30.0"))
 
     # Hard ceiling per match — defense-in-depth (6 minutes)
     per_match_timeout: float = 360.0

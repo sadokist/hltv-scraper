@@ -541,9 +541,6 @@ class HLTVClient:
             self._last_eval_ok = time.monotonic()
             return result
         except asyncio.TimeoutError:
-            # Timeout means CDP didn't respond in time, but the browser
-            # process is likely still alive — update health timestamp.
-            self._last_eval_ok = time.monotonic()
             raise HLTVFetchError(
                 f"CDP evaluate timed out after {timeout}s", url=""
             )
