@@ -20,8 +20,7 @@ COPY migrations/ migrations/
 
 RUN pip install --no-cache-dir -e .
 
-# Data volume for logs and HTML archive
-VOLUME /app/data
+RUN mkdir -p /app/data
 
 # Start Xvfb then run the scraper
 CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x900x24 -nolisten tcp &  sleep 1 && exec hltv-scraper"]
