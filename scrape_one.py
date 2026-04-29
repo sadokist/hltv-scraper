@@ -85,7 +85,7 @@ async def main(print_only: bool) -> None:
     from scraper.repository import MatchRepository
     from scraper.storage import HtmlStorage
 
-    config = ScraperConfig(save_html=True)
+    config = ScraperConfig(save_html=True, proxy_file="proxies.txt")
 
     print("Connecting to database...")
     db = Database()
