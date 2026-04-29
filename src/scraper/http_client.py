@@ -614,6 +614,20 @@ class HLTVClient:
                 # just needs a Turnstile click.  The challenge page loads
                 # quickly but the load event never fires (no onload), so
                 # tab.get() always times out.
+                #
+                # Stop the stalled load first so Chrome's renderer is no longer
+                # busy fetching resources through the proxy.  Without this,
+                # subsequent CDP evaluate commands queue behind the stalled
+                # navigation and time out too.
+                try:
+                    from nodriver.cdp import page as _cdp_page
+                    await asyncio.wait_for(
+                        tab.send(_cdp_page.stop_loading()),
+                        timeout=2.0,
+                    )
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
                 self._last_eval_ok = time.monotonic()
                 _timeout_title = await self._safe_evaluate(tab, "document.title")
                 if not isinstance(_timeout_title, str):
