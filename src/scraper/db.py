@@ -11,14 +11,29 @@ import psycopg2.extras
 
 logger = logging.getLogger(__name__)
 
-# Default connection parameters (override via env vars or constructor)
-DEFAULT_DSN = {
-    "host": os.getenv("HLTV_DB_HOST", "127.0.0.1"),
-    "port": int(os.getenv("HLTV_DB_PORT", "5433")),
-    "dbname": os.getenv("HLTV_DB_NAME", "HLTV-Historical-Data"),
-    "user": os.getenv("HLTV_DB_USER", "hltv"),
-    "password": os.getenv("HLTV_DB_PASSWORD", "hltv"),
-}
+# Default connection parameters.
+# Supports Railway's DATABASE_URL or individual HLTV_DB_* env vars.
+def _build_default_dsn() -> dict:
+    database_url = os.getenv("DATABASE_URL")
+    if database_url:
+        from urllib.parse import urlparse
+        p = urlparse(database_url)
+        return {
+            "host": p.hostname,
+            "port": p.port or 5432,
+            "dbname": p.path.lstrip("/"),
+            "user": p.username,
+            "password": p.password,
+        }
+    return {
+        "host": os.getenv("HLTV_DB_HOST", "127.0.0.1"),
+        "port": int(os.getenv("HLTV_DB_PORT", "5433")),
+        "dbname": os.getenv("HLTV_DB_NAME", "HLTV-Historical-Data"),
+        "user": os.getenv("HLTV_DB_USER", "hltv"),
+        "password": os.getenv("HLTV_DB_PASSWORD", "hltv"),
+    }
+
+DEFAULT_DSN = _build_default_dsn()
 
 SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS matches (

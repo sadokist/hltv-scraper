@@ -16,6 +16,7 @@ Usage::
 import argparse
 import asyncio
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
@@ -280,13 +281,16 @@ async def async_main(args: argparse.Namespace) -> None:
     clients_to_close: list = []
 
     try:
-        # Load proxy list if provided
+        # Load proxy list — from file, or fall back to PROXY_URL env var
         proxies: list[str] = []
         if args.proxy_file:
             with open(args.proxy_file) as f:
                 proxies = [line.strip() for line in f
                            if line.strip() and not line.strip().startswith("#")]
             logger.info("Loaded %d proxies from %s", len(proxies), args.proxy_file)
+        elif os.environ.get("PROXY_URL"):
+            proxies = [os.environ["PROXY_URL"]]
+            logger.info("Using proxy from PROXY_URL env var")
 
         async def create_pool(count, label, proxy_offset):
             """Create a pool of HLTVClient instances with staggered startup."""
