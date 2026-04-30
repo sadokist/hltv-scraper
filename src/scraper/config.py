@@ -15,8 +15,8 @@ class ScraperConfig:
     """
 
     # Rate limiting: delay between requests
-    min_delay: float = 0.08
-    max_delay: float = 3.0
+    min_delay: float = 2.0
+    max_delay: float = 6.0
 
     # Adaptive backoff on challenge/error
     backoff_factor: float = 1.5
@@ -25,7 +25,7 @@ class ScraperConfig:
     recovery_factor: float = 0.75
 
     # Maximum delay ceiling (seconds)
-    max_backoff: float = 3.0
+    max_backoff: float = 6.0
 
     # tenacity stop_after_attempt
     max_retries: int = 3
