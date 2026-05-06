@@ -155,6 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Skip discovery phase — use existing scrape_queue (for resuming)",
     )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Stop discovery when matches go older than this date (e.g. 2026-01-01)",
+    )
     return parser
 
 
@@ -227,6 +234,10 @@ async def async_main(args: argparse.Namespace) -> None:
         config_overrides["navigation_timeout"] = args.nav_timeout
     if args.per_match_timeout is not None:
         config_overrides["per_match_timeout"] = args.per_match_timeout
+    if args.start_date is not None:
+        from datetime import datetime, timezone
+        dt = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        config_overrides["start_date_ms"] = int(dt.timestamp() * 1000)
     config = ScraperConfig(**config_overrides)
 
     mode = "full" if args.full else "incremental"

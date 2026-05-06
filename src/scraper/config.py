@@ -15,8 +15,8 @@ class ScraperConfig:
     """
 
     # Rate limiting: delay between requests
-    min_delay: float = 2.0
-    max_delay: float = 6.0
+    min_delay: float = 3.0
+    max_delay: float = 8.0
 
     # Adaptive backoff on challenge/error
     backoff_factor: float = 1.5
@@ -25,7 +25,7 @@ class ScraperConfig:
     recovery_factor: float = 0.75
 
     # Maximum delay ceiling (seconds)
-    max_backoff: float = 6.0
+    max_backoff: float = 8.0
 
     # tenacity stop_after_attempt
     max_retries: int = 3
@@ -96,3 +96,7 @@ class ScraperConfig:
     start_offset: int = 0              # Start offset for results pagination
     consecutive_failure_threshold: int = 3  # Halt pipeline after N consecutive failures
     stage_poll_interval: float = 5.0   # Seconds between polls when downstream stage has no work
+
+    # Date filtering: stop discovery when matches go older than this (Unix ms).
+    # Set via --start-date YYYY-MM-DD on the CLI.
+    start_date_ms: int | None = None

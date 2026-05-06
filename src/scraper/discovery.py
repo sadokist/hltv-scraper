@@ -201,6 +201,26 @@ async def run_discovery(
                     offset, config.results_per_page, len(matches),
                 )
 
+            # 5a. Date cutoff: drop matches older than start_date_ms and stop
+            #     paginating once we hit the boundary (results are newest-first).
+            reached_cutoff = False
+            if config.start_date_ms:
+                filtered = [
+                    m for m in matches
+                    if m.timestamp_ms == 0 or m.timestamp_ms >= config.start_date_ms
+                ]
+                if len(filtered) < len(matches):
+                    reached_cutoff = True
+                    logger.info(
+                        "Offset %d: date cutoff reached — keeping %d/%d matches "
+                        "(dropping matches before %s)",
+                        offset, len(filtered), len(matches),
+                        datetime.fromtimestamp(
+                            config.start_date_ms / 1000, tz=timezone.utc
+                        ).strftime("%Y-%m-%d"),
+                    )
+                matches = filtered
+
             # 5. Check incremental early termination BEFORE persisting
             match_ids = [m.match_id for m in matches]
             if incremental:
@@ -237,6 +257,10 @@ async def run_discovery(
                 new_count if incremental else len(matches),
                 stats["matches_found"],
             )
+
+            if reached_cutoff:
+                logger.info("Discovery stopped at date cutoff.")
+                break
 
         except ValueError:
             # _wait_for_selector raises ValueError when the page loaded
